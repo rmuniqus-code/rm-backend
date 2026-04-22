@@ -6,9 +6,8 @@ deploy:
   image: node:20
   only:
     - main
-  variables:
-    RAILWAY_TOKEN: $RAILWAY_API_TOKEN
   before_script:
+    - export RAILWAY_TOKEN=$RAILWAY_API_TOKEN
     - npm install -g @railway/cli
     - echo "Railway CLI version:" && railway --version
     - echo "Service ID set:" && [ -n "$RAILWAY_SERVICE_ID" ] && echo "yes" || echo "NO - variable missing"
