@@ -3,7 +3,7 @@ stages:
 
 deploy:
   stage: deploy
-  image: node:20-alpine
+  image: node:20
   only:
     - main
   variables:
