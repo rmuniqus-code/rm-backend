@@ -1,0 +1,14 @@
+stages:
+  - deploy
+
+deploy:
+  stage: deploy
+  image: node:20-alpine
+  only:
+    - main
+  before_script:
+    - npm install -g @railway/cli
+  script:
+    - railway up --service $RAILWAY_SERVICE_ID --detach
+  environment:
+    name: production
