@@ -21,7 +21,7 @@ function getAnonClient() {
 }
 
 export interface AuthedRequest extends Request {
-  user?: { id: string; email?: string; name: string }
+  user?: { id: string; email?: string; name: string; role: string }
 }
 
 export async function requireAuth(
@@ -50,6 +50,6 @@ export async function requireAuth(
     (supaUser.email ? supaUser.email.split('@')[0] : null) ??
     supaUser.id
 
-  req.user = { id: supaUser.id, email: supaUser.email, name }
+  req.user = { id: supaUser.id, email: supaUser.email, name, role: supaUser.app_metadata?.role ?? 'employee' }
   next()
 }
