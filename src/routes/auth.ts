@@ -2,7 +2,10 @@
  * Auth routes — mounted at /auth (public) and /api/admin (protected).
  *
  * POST /auth/register          — public self-signup, always gets 'employee' role
- * POST /api/admin/create-user  — admin only, creates user with any role + sends invite email
+ * POST /api/admin/create-user  — admin only, creates user with any role + temp password
+ *
+ * Email verification is disabled (no SMTP configured).
+ * Users can sign in immediately after registration.
  */
 
 import { Router } from 'express'
@@ -35,13 +38,13 @@ authRouter.post('/register', asyncHandler(async (req, res) => {
     password,
     user_metadata: { name },
     app_metadata: { role: 'employee' },
-    email_confirm: false, // sends verification email
+    email_confirm: true, // no SMTP — skip verification, user can sign in immediately
   })
 
   if (error) return res.status(400).json({ error: error.message })
 
   return res.status(201).json({
-    message: 'Account created. Please check your email to verify your address before signing in.',
+    message: 'Account created. You can sign in now.',
   })
 }))
 
@@ -54,31 +57,35 @@ adminRouter.post(
       return res.status(403).json({ error: 'Admin access required' })
     }
 
-    const { email, name, role } = req.body as {
+    const { email, name, role, tempPassword } = req.body as {
       email?: string
       name?: string
       role?: string
+      tempPassword?: string
     }
 
-    if (!email || !name || !role) {
-      return res.status(400).json({ error: 'email, name, and role are required' })
+    if (!email || !name || !role || !tempPassword) {
+      return res.status(400).json({ error: 'email, name, role, and tempPassword are required' })
+    }
+    if (tempPassword.length < 8) {
+      return res.status(400).json({ error: 'tempPassword must be at least 8 characters' })
     }
     if (!VALID_ROLES.has(role)) {
       return res.status(400).json({ error: `Invalid role. Must be one of: ${[...VALID_ROLES].join(', ')}` })
     }
 
-    // Create user without password — Supabase sends invite/magic-link email
     const { data, error } = await supabaseAdmin().auth.admin.createUser({
       email,
+      password: tempPassword,
       user_metadata: { name },
       app_metadata: { role },
-      email_confirm: false,
+      email_confirm: true, // no SMTP — account is immediately active
     })
 
     if (error) return res.status(400).json({ error: error.message })
 
     return res.status(201).json({
-      message: `Invite sent to ${email}. They will receive an email to set their password.`,
+      message: `User created. Share these credentials with them — email: ${email}, temp password: ${tempPassword}`,
       userId: data.user?.id,
     })
   }),
