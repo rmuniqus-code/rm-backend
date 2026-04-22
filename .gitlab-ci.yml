@@ -6,8 +6,14 @@ deploy:
   image: node:20-alpine
   only:
     - main
+  variables:
+    RAILWAY_TOKEN: $RAILWAY_TOKEN
   before_script:
     - npm install -g @railway/cli
+    - echo "Railway CLI version:" && railway --version
+    - echo "Project ID set:" && [ -n "$RAILWAY_PROJECT_ID" ] && echo "yes" || echo "NO - variable missing"
+    - echo "Service ID set:" && [ -n "$RAILWAY_SERVICE_ID" ] && echo "yes" || echo "NO - variable missing"
+    - echo "Token set:" && [ -n "$RAILWAY_TOKEN" ] && echo "yes" || echo "NO - variable missing"
   script:
     - railway up --project $RAILWAY_PROJECT_ID --service $RAILWAY_SERVICE_ID --detach
   environment:
