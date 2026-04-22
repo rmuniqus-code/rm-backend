@@ -14,7 +14,8 @@ deploy:
     - echo "Project ID set:" && [ -n "$RAILWAY_PROJECT_ID" ] && echo "yes" || echo "NO - variable missing"
     - echo "Service ID set:" && [ -n "$RAILWAY_SERVICE_ID" ] && echo "yes" || echo "NO - variable missing"
     - echo "Token set:" && [ -n "$RAILWAY_TOKEN" ] && echo "yes" || echo "NO - variable missing"
+    - echo "Environment set:" && [ -n "$RAILWAY_ENVIRONMENT_ID" ] && echo "yes" || echo "NO - variable missing"
   script:
-    - railway up --project $RAILWAY_PROJECT_ID --service $RAILWAY_SERVICE_ID --detach
+    - railway up --project $RAILWAY_PROJECT_ID --service $RAILWAY_SERVICE_ID --environment $RAILWAY_ENVIRONMENT_ID --detach
   environment:
     name: production
