@@ -21,6 +21,16 @@ interface OutlierEntry {
   region?: string
   serviceLine?: string
   projects?: { name: string; allocation_pct: number; status: string }[]
+  chargeability?: {
+    weekly: number | null   // current week chargeable allocation %
+    mtd: number | null      // current period chargeability %
+    ytd: number | null      // YTD average chargeability %
+  }
+  missedTimesheet?: {
+    last4: number           // periods missed in the last 4 months
+    last8: number           // periods missed in the last 8 months
+  }
+  peerUtilization?: number | null // avg utilization of employees at the same designation
 }
 
 function todayMonday(): string {
@@ -36,6 +46,26 @@ function addWeeks(iso: string, weeks: number): string {
   const d = new Date(iso + 'T00:00:00')
   d.setDate(d.getDate() + weeks * 7)
   return d.toISOString().split('T')[0]
+}
+
+function jan1ISO(): string {
+  return `${new Date().getUTCFullYear()}-01-01`
+}
+
+/**
+ * Resolve the default date window for a given comparison period.
+ * Weekly → just the current week. Monthly → last 4 weeks. Yearly → last 52 weeks.
+ * Explicit `from`/`to` query params override this.
+ */
+function resolveDateWindow(period: string | undefined, from: string | null | undefined, to: string | null | undefined) {
+  if (from && to) return { from, to }
+  const monday = todayMonday()
+  switch ((period ?? '').toLowerCase()) {
+    case 'weekly': return { from: monday, to: addWeeks(monday, 1) }
+    case 'yearly': return { from: addWeeks(monday, -52), to: addWeeks(monday, 4) }
+    case 'monthly':
+    default:       return { from: monday, to: addWeeks(monday, 4) }
+  }
 }
 
 function groupBy(outliers: OutlierEntry[], field: keyof OutlierEntry) {
@@ -78,10 +108,12 @@ outliersRouter.get('/', asyncHandler(async (req, res) => {
   const typeFilter = req.query.type as string | undefined
   const regionFilter = req.query.region as string | undefined
   const serviceLineFilter = (req.query.serviceLine as string) || (req.query.department as string)
-  const from = parseISODate(req.query.from as string | undefined) ?? todayMonday()
-  const to = parseISODate(req.query.to as string | undefined) ?? addWeeks(from, 4)
+  const period = req.query.period as string | undefined
+  const explicitFrom = parseISODate(req.query.from as string | undefined)
+  const explicitTo = parseISODate(req.query.to as string | undefined)
+  const { from, to } = resolveDateWindow(period, explicitFrom, explicitTo)
 
-  const [outlierRes, allocRes, locationRes, tsCompRes, empDetailsRes] = await Promise.all([
+  const [outlierRes, allocRes, locationRes, tsCompRes, empDetailsRes, tsAllRes, chargeThisWeekRes, utilByDesigRes] = await Promise.all([
     supabaseAdmin().rpc('fn_outliers', { p_from: from, p_to: to }),
     supabaseAdmin()
       .from('v_resource_allocation_grid')
@@ -109,6 +141,25 @@ outliersRouter.get('/', asyncHandler(async (req, res) => {
       .from('v_employee_details')
       .select('emp_code,region')
       .eq('is_active', true),
+    // All timesheet_compliance rows this year (used for YTD + last-N-period counts per employee)
+    supabaseAdmin()
+      .from('timesheet_compliance')
+      .select('employee_id, period_month, period_start, chargeability_pct, total_hours, employees!inner(employee_id)')
+      .gte('period_start', jan1ISO())
+      .order('period_start', { ascending: false }),
+    // Confirmed chargeable project allocations for the current week → weekly chargeability per emp
+    supabaseAdmin()
+      .from('v_resource_allocation_grid')
+      .select('emp_code, allocation_pct, project_name, project_type')
+      .eq('week_start', todayMonday())
+      .eq('allocation_status', 'confirmed'),
+    // Average utilization per designation over the default window (peer benchmark)
+    supabaseAdmin()
+      .from('v_resource_allocation_grid')
+      .select('emp_code, designation, allocation_pct, project_type, project_name, week_start')
+      .gte('week_start', from)
+      .lte('week_start', to)
+      .eq('allocation_status', 'confirmed'),
   ])
 
   if (outlierRes.error) return res.status(500).json({ error: outlierRes.error.message })
@@ -182,6 +233,89 @@ outliersRouter.get('/', asyncHandler(async (req, res) => {
     }
   }
 
+  // ── Per-employee chargeability (weekly / MTD / YTD) and missed-period counts ──
+  const NON_CHARGEABLE = new Set(['internal', 'non_chargeable', 'non-chargeable', 'training'])
+  const isChargeable = (projectType: string | null | undefined, projectName: string | null | undefined) => {
+    if (!projectName) return false
+    const pt = (projectType ?? '').toLowerCase().trim()
+    if (!pt) return true
+    return !NON_CHARGEABLE.has(pt)
+  }
+
+  // Weekly chargeability — sum of confirmed chargeable allocation_pct for the current week
+  const weeklyChargeByEmp = new Map<string, number>()
+  for (const r of (chargeThisWeekRes.data ?? []) as any[]) {
+    if (!isChargeable(r.project_type, r.project_name)) continue
+    weeklyChargeByEmp.set(r.emp_code, (weeklyChargeByEmp.get(r.emp_code) ?? 0) + Number(r.allocation_pct || 0))
+  }
+
+  // MTD + YTD chargeability + missed-period counts from timesheet_compliance
+  const tsYtdRows = (tsAllRes.data ?? []) as any[]
+  const empYtdStats = new Map<string, {
+    periods: { period: string; chargeability: number; missed: boolean }[]
+  }>()
+  for (const r of tsYtdRows) {
+    const empCode = r.employees?.employee_id ?? ''
+    if (!empCode) continue
+    if (!empYtdStats.has(empCode)) empYtdStats.set(empCode, { periods: [] })
+    empYtdStats.get(empCode)!.periods.push({
+      period: r.period_month,
+      chargeability: Number(r.chargeability_pct) || 0,
+      missed: Number(r.total_hours) === 0,
+    })
+  }
+
+  // Peer utilization by designation — average util across visible date window
+  type PeerAgg = { empWeekly: Map<string, Map<string, number>> }
+  const peerByDesig = new Map<string, PeerAgg>()
+  for (const r of (utilByDesigRes.data ?? []) as any[]) {
+    if (!isChargeable(r.project_type, r.project_name)) continue
+    const desig = r.designation ?? 'Unknown'
+    if (!peerByDesig.has(desig)) peerByDesig.set(desig, { empWeekly: new Map() })
+    const agg = peerByDesig.get(desig)!
+    if (!agg.empWeekly.has(r.emp_code)) agg.empWeekly.set(r.emp_code, new Map())
+    const weeks = agg.empWeekly.get(r.emp_code)!
+    weeks.set(r.week_start, (weeks.get(r.week_start) ?? 0) + Number(r.allocation_pct || 0))
+  }
+  const peerAvgByDesig = new Map<string, number>()
+  for (const [desig, agg] of peerByDesig.entries()) {
+    const perEmpAvg: number[] = []
+    for (const weeks of agg.empWeekly.values()) {
+      const vals = [...weeks.values()]
+      if (vals.length === 0) continue
+      perEmpAvg.push(vals.reduce((s, v) => s + v, 0) / vals.length)
+    }
+    if (perEmpAvg.length > 0) {
+      peerAvgByDesig.set(desig, Number((perEmpAvg.reduce((s, v) => s + v, 0) / perEmpAvg.length).toFixed(1)))
+    }
+  }
+
+  for (const o of outliers) {
+    const stats = empYtdStats.get(o.employee_code)
+    const periods = (stats?.periods ?? []).slice().sort((a, b) => (a.period < b.period ? 1 : -1))
+
+    const mtd = periods[0]?.chargeability ?? null
+    const ytd = periods.length > 0
+      ? Number(((periods.reduce((s, p) => s + p.chargeability, 0) / periods.length) * 100).toFixed(1))
+      : null
+    const weekly = weeklyChargeByEmp.get(o.employee_code) ?? null
+
+    o.chargeability = {
+      weekly: weekly != null ? Number(Math.min(100, weekly).toFixed(1)) : null,
+      mtd: mtd != null ? Number((mtd * 100).toFixed(1)) : null,
+      ytd,
+    }
+
+    o.missedTimesheet = {
+      last4: periods.slice(0, 4).filter(p => p.missed).length,
+      last8: periods.slice(0, 8).filter(p => p.missed).length,
+    }
+
+    if (o.outlier_type === 'low_utilization_ad' || o.outlier_type === 'low_utilization_am') {
+      o.peerUtilization = peerAvgByDesig.get(o.designation) ?? null
+    }
+  }
+
   if (typeFilter) {
     const types = typeFilter.split(',').map(t => t.trim())
     outliers = outliers.filter(o => types.includes(o.outlier_type))
@@ -208,6 +342,7 @@ outliersRouter.get('/', asyncHandler(async (req, res) => {
     summary,
     outliers: deduped,
     dateRange: { from, to },
+    period: (period ?? 'monthly').toLowerCase(),
     aggregations: { byRegion, byServiceLine, byDepartment },
   })
 }))

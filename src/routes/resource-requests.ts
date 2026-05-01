@@ -449,3 +449,104 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
 
   res.json({ request: updatedRequest, allocationsCreated })
 }))
+
+// ── POST /:id/shortlist ───────────────────────────────────────
+// Mark a candidate against a request without yet creating allocations.
+// Use this when the RM wants to pencil someone in before confirming a booking
+// (R2 — "shortlist resource as an option — directly gets booked on the tool").
+resourceRequestsRouter.post('/:id/shortlist', asyncHandler(async (req: AuthedRequest, res) => {
+  const id = req.params.id
+  const body = req.body ?? {}
+  const sb = supabaseAdmin()
+
+  const { data: before, error: fetchErr } = await sb
+    .from('resource_requests')
+    .select('*, project:projects(name)')
+    .eq('id', id)
+    .single()
+  if (fetchErr || !before) return res.status(404).json({ error: 'Request not found' })
+
+  const resourceName = (body.resource_name ?? body.resource_requested ?? null) as string | null
+
+  const { data: updated, error: updateErr } = await sb
+    .from('resource_requests')
+    .update({
+      approval_status: 'shortlisted',
+      resource_requested: resourceName ?? before.resource_requested,
+      notes: body.notes ?? before.notes,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .select()
+    .single()
+  if (updateErr) return res.status(500).json({ error: updateErr.message })
+
+  const projectName = (before as any).project?.name ?? 'Unknown Project'
+  logAudit({
+    action: 'Updated',
+    entity: 'Request',
+    entityName: `#${before.request_number} — ${projectName}`,
+    entityId: id,
+    userName: req.user?.name ?? 'System',
+    field: 'approval_status',
+    oldValue: before.approval_status ?? 'pending',
+    newValue: 'shortlisted',
+    metadata: resourceName ? { shortlisted_resource: resourceName } : undefined,
+  })
+
+  res.json({ request: updated })
+}))
+
+// ── POST /:id/undo ───────────────────────────────────────────
+// Revert the request to the state it was in before the most recent audit entry
+// (R1 — "Unable to undo any changes"). Only reverts editable fields; booking
+// allocations created by /approve must be reversed manually for now.
+resourceRequestsRouter.post('/:id/undo', asyncHandler(async (req: AuthedRequest, res) => {
+  const id = req.params.id
+  const sb = supabaseAdmin()
+
+  const { data: auditRows, error: auditErr } = await sb
+    .from('audit_log')
+    .select('*')
+    .eq('entity', 'Request')
+    .eq('entity_id', id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (auditErr) return res.status(500).json({ error: auditErr.message })
+
+  const last = auditRows?.[0]
+  if (!last) return res.status(404).json({ error: 'No audit history to undo' })
+
+  const revert: Record<string, unknown> = { updated_at: new Date().toISOString() }
+  const changes = (last.metadata as any)?.changes as Array<{ field: string; from: unknown; to: unknown }> | undefined
+
+  if (changes && changes.length > 0) {
+    for (const c of changes) {
+      revert[c.field] = c.from
+    }
+  } else if (last.field && last.old_value !== undefined) {
+    revert[last.field] = last.old_value
+  } else {
+    return res.status(400).json({ error: 'Latest audit entry has no reversible changes' })
+  }
+
+  const { data: updated, error: updateErr } = await sb
+    .from('resource_requests')
+    .update(revert)
+    .eq('id', id)
+    .select()
+    .single()
+  if (updateErr) return res.status(500).json({ error: updateErr.message })
+
+  logAudit({
+    action: 'Updated',
+    entity: 'Request',
+    entityName: last.entity_name ?? `#${updated.request_number}`,
+    entityId: id,
+    userName: req.user?.name ?? 'System',
+    field: 'undo',
+    metadata: { revertedAuditId: last.id, revertedFields: Object.keys(revert).filter(k => k !== 'updated_at') },
+  })
+
+  res.json({ request: updated, reverted: revert })
+}))

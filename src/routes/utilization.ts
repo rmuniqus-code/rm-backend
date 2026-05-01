@@ -30,12 +30,16 @@ utilizationRouter.get('/', asyncHandler(async (req, res) => {
   const grade = req.query.grade as string | undefined
   const department = req.query.department as string | undefined
 
+  // Utilization = chargeable client work / available hours.
+  // Filter to confirmed allocations on chargeable projects only — tentative
+  // (proposed) work and internal/non-billable/training allocations must not
+  // inflate the number.
   let query = supabaseAdmin()
     .from('v_resource_allocation_grid')
-    .select('emp_code, employee_name, designation, department, location, week_start, allocation_pct, allocation_status')
+    .select('emp_code, employee_name, designation, department, location, week_start, allocation_pct, allocation_status, project_type, project_name')
     .gte('week_start', from)
     .lte('week_start', to)
-    .in('allocation_status', ['confirmed', 'proposed'])
+    .eq('allocation_status', 'confirmed')
 
   if (location) query = query.eq('location', location)
   if (grade) query = query.eq('designation', grade)
@@ -44,9 +48,18 @@ utilizationRouter.get('/', asyncHandler(async (req, res) => {
   const { data: rows, error } = await query
   if (error) return res.status(500).json({ error: error.message })
 
+  const NON_CHARGEABLE = new Set(['internal', 'non_chargeable', 'non-chargeable', 'training'])
+  const isChargeable = (projectType: string | null | undefined, projectName: string | null | undefined) => {
+    if (!projectName) return false // leaves / availability rows have no project
+    const pt = (projectType ?? '').toLowerCase().trim()
+    if (!pt) return true // default project_type is 'chargeable' per schema
+    return !NON_CHARGEABLE.has(pt)
+  }
+
   const empWeeklyUtil = new Map<string, { name: string; designation: string; weeks: Map<string, number> }>()
 
   for (const r of (rows ?? [])) {
+    if (!isChargeable(r.project_type, r.project_name)) continue
     if (!empWeeklyUtil.has(r.emp_code)) {
       empWeeklyUtil.set(r.emp_code, { name: r.employee_name, designation: r.designation, weeks: new Map() })
     }

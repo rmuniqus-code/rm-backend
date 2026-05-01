@@ -6,6 +6,7 @@
 import { Router } from 'express'
 import { getSupabase } from '../services/ingestion/ingest'
 import { asyncHandler } from '../middleware/error'
+import { normalizeSubFunction, isExcluded } from '../utils/sub-function-normalize'
 
 function toLocalISO(d: Date): string {
   const y = d.getFullYear()
@@ -98,12 +99,13 @@ findAvailabilityRouter.get('/', asyncHandler(async (req, res) => {
   }
 
   const resources = employees
+    .filter((e: any) => !isExcluded(e.department, e.sub_function))
     .map((e: any) => ({
       id: e.emp_code,
       name: e.name,
       grade: e.designation ?? '',
       serviceLine: e.department ?? '',
-      subServiceLine: e.sub_function ?? '',
+      subServiceLine: normalizeSubFunction(e.sub_function ?? ''),
       location: e.location ?? '',
       region: e.region ?? '',
       primarySkill: skillMap.get(e.emp_code) ?? '',

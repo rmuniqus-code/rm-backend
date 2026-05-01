@@ -13,6 +13,7 @@
 
 import { SupabaseClient } from '@supabase/supabase-js'
 import { parseExcelBuffer, detectFileType, parseMonthString } from './parse-excel'
+import { isExcluded } from '../../utils/sub-function-normalize'
 import type { ParsedRow, ValidationError, FileType } from './parse-excel'
 import { supabaseAdmin } from '../../db/supabase-admin'
 
@@ -124,17 +125,23 @@ async function processRow(
   periodInfo: { periodMonth: string; periodStart: string; periodEnd: string },
   cache: LookupCache,
   sourceFile: string,
-): Promise<ProcessedComplianceRow | ValidationError> {
+): Promise<ProcessedComplianceRow | ValidationError | null> {
   const d = row.data
   const sb = getSupabase()
 
   try {
     // 1. Resolve department
     const deptName = String(d['Department Name'] ?? '')
+
+    // Skip Central service line and LT sub-function entirely — they must not
+    // appear anywhere in the tool.
+    const subNameRaw = String(d['Sub-Function'] ?? '')
+    if (isExcluded(deptName, subNameRaw)) return null
+
     const deptId = deptName ? await resolveOrCreate('departments', 'name', deptName, cache.departments) : null
 
     // 2. Resolve sub-function (needs deptId) — composite unique key (department_id, name)
-    const subName = String(d['Sub-Function'] ?? '')
+    const subName = subNameRaw
     let subId: string | null = null
     if (subName && deptId) {
       const cacheKey = `${deptId}|${subName}`
@@ -341,6 +348,8 @@ export async function ingestExcelFile(
       batch.map(row => processRow(row, fileType, periodInfo, cache, fileName))
     )
     for (const result of results) {
+      // null means the row was intentionally skipped (e.g. Central service line)
+      if (result === null) continue
       // ProcessedComplianceRow has empUuid; ValidationError has row/field/message
       if ('empUuid' in result) {
         successCount++

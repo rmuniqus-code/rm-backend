@@ -107,10 +107,16 @@ export function parseMonthString(month: string): {
     const start = new Date(year, monthIdx, 1)
     const end = new Date(year, monthIdx + 1, 0) // last day of month
 
+    // Use local date parts — never toISOString() which shifts to UTC and can
+    // change the day (e.g. Feb 1 00:00 IST → Jan 31 18:30 UTC).
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const fmtDate = (d: Date) =>
+      `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+
     return {
       label: `${start.toLocaleString('en', { month: 'short' })}-${year}`,
-      periodStart: start.toISOString().split('T')[0],
-      periodEnd: end.toISOString().split('T')[0],
+      periodStart: fmtDate(start),
+      periodEnd: fmtDate(end),
     }
   }
   return null

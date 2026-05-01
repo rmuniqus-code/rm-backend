@@ -20,6 +20,20 @@
 
 import { supabaseAdmin } from '../db/supabase-admin'
 
+/**
+ * Resolve the employees.id UUID for a Supabase auth user by their email.
+ * Returns null if no matching employee record is found.
+ */
+export async function resolveEmployeeIdByEmail(email?: string | null): Promise<string | null> {
+  if (!email) return null
+  const { data } = await supabaseAdmin()
+    .from('employees')
+    .select('id')
+    .ilike('email', email.trim())
+    .maybeSingle()
+  return (data?.id as string | undefined) ?? null
+}
+
 interface NotificationPayload {
   type: string
   title: string
@@ -96,4 +110,69 @@ export async function notifyAllocationUpdated(
     message: `${employeeName}'s allocation on ${projectName}: ${change}`,
     relatedEntityType: 'forecast_allocation',
   })
+}
+
+/**
+ * Send targeted notifications for an allocation action to:
+ *  1. The resource (employee whose allocation changed) — always, when resourceEmployeeId is known.
+ *  2. The actor (RM/admin who made the change) — only when their employee UUID is resolved and
+ *     differs from the resource, so a person doesn't receive two identical notifications.
+ *
+ * Both notifications are fire-and-forget; failures are logged but do not abort the caller.
+ */
+export async function notifyAllocationAction(opts: {
+  action: 'created' | 'updated' | 'deleted' | 'extended' | 'status_changed'
+  employeeName: string | null
+  projectName: string | null
+  /** Human-readable description of what changed (e.g. "100% confirmed (week of 2026-05-04)") */
+  change: string
+  /** employees.id of the resource whose allocation was changed */
+  resourceEmployeeId: string | null
+  /** employees.id of the RM/admin who made the change — null if not resolvable */
+  actorEmployeeId: string | null
+  actorName: string
+  relatedEntityId?: string | null
+}): Promise<void> {
+  const { action, employeeName, projectName, change, resourceEmployeeId, actorEmployeeId, actorName, relatedEntityId } = opts
+  const resource = employeeName ?? 'Resource'
+  const project  = projectName  ?? 'project'
+
+  const actionTitles: Record<string, string> = {
+    created:        'New Allocation',
+    updated:        'Allocation Updated',
+    deleted:        'Allocation Removed',
+    extended:       'Allocation Extended',
+    status_changed: 'Allocation Status Changed',
+  }
+  const title = actionTitles[action] ?? 'Allocation Changed'
+
+  const emitSafe = async (payload: Parameters<typeof emitNotification>[0]) => {
+    try { await emitNotification(payload) } catch (err) {
+      console.error('[notify] notifyAllocationAction failed:', err)
+    }
+  }
+
+  // 1. Notify the resource
+  if (resourceEmployeeId) {
+    await emitSafe({
+      type:                'allocation_updated',
+      title,
+      message:             `Your allocation on ${project}: ${change}`,
+      recipientId:         resourceEmployeeId,
+      relatedEntityType:   'forecast_allocation',
+      relatedEntityId:     relatedEntityId ?? null,
+    })
+  }
+
+  // 2. Notify the actor (confirmation of the action they performed)
+  if (actorEmployeeId && actorEmployeeId !== resourceEmployeeId) {
+    await emitSafe({
+      type:                'allocation_updated',
+      title:               `${title} — Confirmed`,
+      message:             `${resource}'s allocation on ${project}: ${change}`,
+      recipientId:         actorEmployeeId,
+      relatedEntityType:   'forecast_allocation',
+      relatedEntityId:     relatedEntityId ?? null,
+    })
+  }
 }

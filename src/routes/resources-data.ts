@@ -6,10 +6,11 @@
 import { Router } from 'express'
 import { getSupabase } from '../services/ingestion/ingest'
 import { asyncHandler } from '../middleware/error'
+import { normalizeSubFunction, isExcluded } from '../utils/sub-function-normalize'
 
 const SELECT_COLS =
   'emp_code,employee_name,designation,department,sub_function,location,' +
-  'week_start,allocation_pct,allocation_status,project_name,project_client,project_type'
+  'week_start,allocation_pct,allocation_status,project_name,project_client,project_type,engagement_manager,current_em_ep'
 
 const PAGE_SIZE = 1000
 
@@ -39,10 +40,26 @@ export const resourcesDataRouter = Router()
 
 resourcesDataRouter.get('/', asyncHandler(async (req, res) => {
   const today = new Date()
-  const fromISO = (req.query.from as string) ?? addWeeks(mondayOf(today), -8)
-  const toISO = (req.query.to as string) ?? addWeeks(mondayOf(today), 20)
-
   const sb = getSupabase()
+
+  // Derive the default date range from the actual data in forecast_allocations so
+  // that ALL uploaded forecast data is visible, regardless of how far back or
+  // forward it extends.  A narrow fixed-offset window (e.g. -8 to +20 weeks)
+  // silently excludes historical allocations that were ingested but lie outside
+  // the window — the resource view would fetch nothing for those weeks.
+  let defaultFrom = addWeeks(mondayOf(today), -8)
+  let defaultTo   = addWeeks(mondayOf(today), 20)
+  if (!req.query.from || !req.query.to) {
+    const [{ data: minRow }, { data: maxRow }] = await Promise.all([
+      sb.from('forecast_allocations').select('week_start').order('week_start', { ascending: true  }).limit(1),
+      sb.from('forecast_allocations').select('week_start').order('week_start', { ascending: false }).limit(1),
+    ])
+    if (minRow?.[0]?.week_start) defaultFrom = minRow[0].week_start
+    if (maxRow?.[0]?.week_start) defaultTo   = maxRow[0].week_start
+  }
+
+  const fromISO = (req.query.from as string) ?? defaultFrom
+  const toISO   = (req.query.to   as string) ?? defaultTo
 
   const { count, error: countError } = await sb
     .from('v_resource_allocation_grid')
@@ -83,7 +100,7 @@ resourcesDataRouter.get('/', asyncHandler(async (req, res) => {
   const [{ data: skillRows }, { data: empMetaRows }] = await Promise.all([
     sb.from('v_employee_skills').select('emp_code,primary_skill,secondary_skills'),
     sb.from('v_employee_details')
-      .select('emp_code,region,department')
+      .select('emp_code,region,department,sub_function')
       .eq('is_active', true),
   ])
 
@@ -97,15 +114,24 @@ resourcesDataRouter.get('/', asyncHandler(async (req, res) => {
     }
   }
 
-  const empRegionMap: Record<string, { region: string; department: string }> = {}
+  const empRegionMap: Record<string, { region: string; department: string; subFunction: string }> = {}
   for (const row of empMetaRows ?? []) {
-    if (row.emp_code) {
+    if (row.emp_code && !isExcluded(row.department, row.sub_function)) {
       empRegionMap[row.emp_code] = {
         region: row.region ?? '',
         department: row.department ?? '',
+        subFunction: normalizeSubFunction(row.sub_function ?? ''),
       }
     }
   }
 
-  res.json({ rows: allRows, skills: skillsMap, empMeta: empRegionMap, fromISO, toISO })
+  // Normalize sub_function in every row and exclude Central / LT rows.
+  const normalizedRows = allRows
+    .filter((r: any) => !isExcluded(r.department, r.sub_function))
+    .map((r: any) => ({
+    ...r,
+    sub_function: normalizeSubFunction(r.sub_function),
+  }))
+
+  res.json({ rows: normalizedRows, skills: skillsMap, empMeta: empRegionMap, fromISO, toISO })
 }))

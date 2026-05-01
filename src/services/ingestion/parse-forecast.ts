@@ -171,6 +171,35 @@ const STATUS_KEYWORDS: Record<string, AllocationStatus> = {
 }
 
 /**
+ * Lowercase tokens that appear in the "Employee ID" column when a real ID has
+ * not yet been assigned (typically pending joiners).  Combined with
+ * STATUS_KEYWORDS, these are the values we synthesize a Name+DOJ key for
+ * instead of using verbatim — see buildPendingEmployeeId.
+ */
+export const PLACEHOLDER_IDS = new Set(['jip', 'tbc', 'tbd', 'tba', 'na', 'n/a'])
+
+/** Prefix used for synthesized IDs of pending joiners (Employee ID == "JIP"). */
+export const PENDING_EMP_ID_PREFIX = 'PENDING'
+
+/**
+ * Build a stable synthetic Employee ID for a pending joiner from their
+ * Resource Name and DOJ.  The format is `PENDING-<slugified-name>-<YYYY-MM-DD>`,
+ * deterministic across re-uploads as long as both inputs stay constant.  The
+ * ingest layer reconciles a synthetic record into a real-ID record by
+ * matching (name, DOJ) when the real ID first appears in a later upload.
+ *
+ * Returns null if either name or DOJ is empty — without DOJ we cannot tell
+ * two different joiners with the same name apart, so the row should be
+ * rejected rather than collapsed.
+ */
+export function buildPendingEmployeeId(name: string, doj: string | null): string | null {
+  if (!doj) return null
+  const slug = name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '')
+  if (!slug) return null
+  return `${PENDING_EMP_ID_PREFIX}-${slug}-${doj}`
+}
+
+/**
  * Parse free-text allocation cell into structured entries.
  *
  * Examples:
@@ -481,6 +510,15 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
   const merges: XLSX.Range[] = sheet['!merges'] || []
   const mergeValueMap = new Map<string, unknown>()  // "row,col" → origin value
 
+  // Lowest column index that is a weekly forecast column.
+  // Vertical merges must NOT be expanded into weekly columns: doing so would
+  // propagate one employee sub-row's project text down into adjacent sub-rows,
+  // making every project appear in every row for the same employee (root cause
+  // of phantom 1000%+ allocations in multi-row-per-employee sheets).
+  const firstWeekCol = weekColumnIndexes.length > 0
+    ? weekColumnIndexes.reduce((min, w) => Math.min(min, w.colIndex), Infinity)
+    : Infinity
+
   for (const merge of merges) {
     const originCell = XLSX.utils.encode_cell({ r: merge.s.r, c: merge.s.c })
     const originValue = sheet[originCell]?.v ?? null
@@ -489,6 +527,9 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
     for (let r = merge.s.r; r <= merge.e.r; r++) {
       for (let c = merge.s.c; c <= merge.e.c; c++) {
         if (r === merge.s.r && c === merge.s.c) continue  // skip origin itself
+        // Block vertical propagation into weekly columns (only master columns
+        // like Employee ID / Name may propagate across rows)
+        if (r !== merge.s.r && c >= firstWeekCol) continue
         mergeValueMap.set(`${r},${c}`, originValue)
       }
     }
@@ -521,7 +562,7 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
       continue
     }
 
-    // Parse DOJ
+    // Parse DOJ early — needed to synthesize stable IDs for placeholder rows
     const dojRaw = getCellValue(i, masterColumnMap['DOJ'])
     let doj: string | null = null
     if (dojRaw instanceof Date) {
@@ -530,16 +571,53 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
       doj = excelDateToISO(dojRaw as number) ?? null
     }
 
+    // Skip JIP (Joining in Progress) resources — they have no real employee
+    // record yet and should not appear in the resource manager.
+    const empIdStr = String(empIdRaw).trim()
+    const empIdLower = empIdStr.toLowerCase()
+    if (empIdLower === 'jip') continue
+
+    // Resolve other placeholder Employee IDs ("TBC", …) into a stable synthetic
+    // key derived from Resource Name + DOJ.  Without this, every pending joiner
+    // shares the literal string "TBC" as their Employee ID and the multi-row
+    // merge key collapses them all onto one phantom record (the source of the
+    // 1000% allocation bug).  When HR later assigns a real ID, the ingest layer
+    // reconciles by matching name+DOJ and renames the synthetic record in place
+    // — preserving the UUID and all forecast_allocations FK references to it.
+    const isPlaceholderId =
+      PLACEHOLDER_IDS.has(empIdLower) || empIdLower in STATUS_KEYWORDS
+    let resolvedEmpId = empIdStr
+    if (isPlaceholderId) {
+      const synthetic = buildPendingEmployeeId(String(nameRaw).trim(), doj)
+      if (!synthetic) {
+        errors.push({
+          row: i + 1,
+          field: 'Employee ID',
+          message: `Placeholder Employee ID "${empIdStr}" for "${nameRaw}" requires a DOJ to synthesize a stable key`,
+        })
+        continue
+      }
+      resolvedEmpId = synthetic
+    }
+
     // Parse utilization metrics
     const mtdRaw = mtdColIndex >= 0 ? getCellValue(i, mtdColIndex) : null
     const wcRaw = wcColIndex >= 0 ? getCellValue(i, wcColIndex) : null
     const ytdRaw = ytdColIndex >= 0 ? getCellValue(i, ytdColIndex) : null
     const commentsRaw = commentsColIndex >= 0 ? getCellValue(i, commentsColIndex) : null
 
+    // Strip placeholder values from the email column (JIP rows often have email="JIP")
+    const emailRaw = safeStr(getCellValue(i, masterColumnMap['Email']))
+    const email = emailRaw && (
+      PLACEHOLDER_IDS.has(emailRaw.toLowerCase()) ||
+      emailRaw.toLowerCase() in STATUS_KEYWORDS ||
+      !emailRaw.includes('@')
+    ) ? null : emailRaw
+
     const employee: ForecastEmployee = {
-      employeeId: String(empIdRaw).trim(),
+      employeeId: resolvedEmpId,
       name: String(nameRaw).trim(),
-      email: safeStr(getCellValue(i, masterColumnMap['Email'])),
+      email,
       doj,
       location: safeStr(getCellValue(i, masterColumnMap['Location'])),
       grade: safeStr(getCellValue(i, masterColumnMap['Resource Grade'])),
@@ -633,7 +711,11 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
           // allocationsEqual handles any number of entries (single project,
           // dual-project like "BASL + Task US", status-only, …) and normalises
           // project names so minor whitespace/case differences don't break matches.
-          if (before && after && allocationsEqual(before, after)) {
+          //
+          // Hard cap: only fill gaps ≤ 4 consecutive empty weeks.  Larger gaps
+          // are intentionally absent, not merge-boundary artefacts.
+          const gapSize = wi - gapStart
+          if (before && after && allocationsEqual(before, after) && gapSize <= 4) {
             for (let gi = gapStart; gi < wi; gi++) {
               const wd = weekColumnIndexes[gi].weekDate
               // Deep-copy each entry so mutations downstream don't alias shared objects
@@ -647,7 +729,14 @@ export function parseForecastExcel(buffer: ArrayBuffer): ForecastParseResult {
       }
     }
 
-    rows.push({ rowIndex: i + 1, employee, weeklyAllocations })
+    // Multi-row-per-employee: if this Employee ID already has a row, merge
+    // the weekly allocations into it rather than creating a duplicate.
+    const existingRow = rows.find(r => r.employee.employeeId === employee.employeeId)
+    if (existingRow) {
+      existingRow.weeklyAllocations.push(...weeklyAllocations)
+    } else {
+      rows.push({ rowIndex: i + 1, employee, weeklyAllocations })
+    }
   }
 
   return { rows, weekColumns, errors, totalRows: rows.length }

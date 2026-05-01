@@ -10,7 +10,9 @@ import cors from 'cors'
 import { errorHandler } from './middleware/error'
 import { requireAuth } from './middleware/auth'
 
+import { allocationsRouter } from './routes/allocations'
 import { auditLogRouter } from './routes/audit-log'
+import { bookingsRouter } from './routes/bookings'
 import { dashboardDataRouter } from './routes/dashboard-data'
 import { exportsRouter } from './routes/exports'
 import { fileUploadsRouter } from './routes/file-uploads'
@@ -48,7 +50,9 @@ app.use('/auth', authRouter)
 // All /api/* routes require a verified Supabase access token.
 app.use('/api', requireAuth)
 
+app.use('/api/allocations', allocationsRouter)
 app.use('/api/audit-log', auditLogRouter)
+app.use('/api/bookings', bookingsRouter)
 app.use('/api/dashboard-data', dashboardDataRouter)
 app.use('/api/exports', exportsRouter)
 app.use('/api/file-uploads', fileUploadsRouter)

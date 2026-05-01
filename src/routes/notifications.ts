@@ -5,18 +5,31 @@
 import { Router } from 'express'
 import { supabaseAdmin } from '../db/supabase-admin'
 import { asyncHandler, parseInt32 } from '../middleware/error'
+import { resolveEmployeeIdByEmail } from '../services/notify'
+import type { AuthedRequest } from '../middleware/auth'
 
 export const notificationsRouter = Router()
 
-notificationsRouter.get('/', asyncHandler(async (req, res) => {
+notificationsRouter.get('/', asyncHandler(async (req: AuthedRequest, res) => {
   const unreadOnly = req.query.unread_only === 'true'
   const limit = parseInt32(req.query.limit as string | undefined, 20)
+
+  // Resolve the current user's employee UUID so we can show their targeted
+  // notifications alongside broadcast (recipient_id IS NULL) notifications.
+  const employeeId = await resolveEmployeeIdByEmail(req.user?.email)
 
   let query = supabaseAdmin()
     .from('notifications')
     .select('*', { count: 'exact' })
     .order('created_at', { ascending: false })
     .limit(limit)
+
+  if (employeeId) {
+    // Show notifications explicitly addressed to this user OR broadcast ones
+    query = query.or(`recipient_id.is.null,recipient_id.eq.${employeeId}`)
+  }
+  // If the user can't be mapped to an employee (e.g. a super-admin with no employee
+  // record), fall back to showing all notifications so they don't see a blank panel.
 
   if (unreadOnly) query = query.eq('is_read', false)
 

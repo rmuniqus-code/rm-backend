@@ -16,9 +16,10 @@
  */
 
 import { getSupabase } from './ingest'
-import { parseForecastExcel } from './parse-forecast'
+import { parseForecastExcel, PENDING_EMP_ID_PREFIX } from './parse-forecast'
 import type { ForecastRow, AllocationEntry } from './parse-forecast'
 import type { ValidationError } from './parse-excel'
+import { isExcluded } from '../../utils/sub-function-normalize'
 
 // ─── Types ───────────────────────────────────────────────────
 
@@ -41,6 +42,16 @@ interface ForecastCache {
   departments: Map<string, string>      // name → uuid
   employees: Map<string, string>        // employee_id → uuid
   projects: Map<string, string>         // normalized project name → uuid
+  // Pending-joiner records keyed by `name|doj` (lowercased name).  Used to
+  // reconcile a synthetic-ID record into a real-ID record when HR finally
+  // assigns an Employee ID — we rename the row in place so the UUID (and
+  // every forecast_allocations / allocations FK referencing it) is preserved.
+  pendingByNameDoj: Map<string, { uuid: string; pendingEmpId: string }>
+}
+
+/** Lowercase + collapse whitespace for stable name matching across uploads. */
+function normalizeName(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, ' ')
 }
 
 // ─── Normalize project name for dedup ────────────────────────
@@ -72,14 +83,21 @@ async function buildForecastCache(): Promise<ForecastCache> {
     departments: new Map(),
     employees: new Map(),
     projects: new Map(),
+    pendingByNameDoj: new Map(),
   }
 
-  const [desigs, subs, locs, depts, emps, projs] = await Promise.all([
+  const [desigs, subs, locs, depts, emps, pendingEmps, projs] = await Promise.all([
     sb.from('designations').select('id, name'),
     sb.from('sub_functions').select('id, name'),
     sb.from('locations').select('id, name'),
     sb.from('departments').select('id, name'),
     sb.from('employees').select('id, employee_id'),
+    // Pre-load pending-joiner records so we can reconcile by name+DOJ when a
+    // real Employee ID later arrives in a row whose name+DOJ already exist
+    // under a synthetic PENDING- key.
+    sb.from('employees')
+      .select('id, employee_id, name, date_of_joining')
+      .like('employee_id', `${PENDING_EMP_ID_PREFIX}-%`),
     sb.from('projects').select('id, name'),
   ])
 
@@ -88,6 +106,11 @@ async function buildForecastCache(): Promise<ForecastCache> {
   locs.data?.forEach((r: { id: string; name: string }) => cache.locations.set(r.name, r.id))
   depts.data?.forEach((r: { id: string; name: string }) => cache.departments.set(r.name, r.id))
   emps.data?.forEach((r: { id: string; employee_id: string }) => cache.employees.set(r.employee_id, r.id))
+  pendingEmps.data?.forEach((r: { id: string; employee_id: string; name: string | null; date_of_joining: string | null }) => {
+    if (!r.name || !r.date_of_joining) return
+    const key = `${normalizeName(r.name)}|${r.date_of_joining}`
+    cache.pendingByNameDoj.set(key, { uuid: r.id, pendingEmpId: r.employee_id })
+  })
   projs.data?.forEach((r: { id: string; name: string }) => cache.projects.set(normalizeProjectName(r.name), r.id))
 
   return cache
@@ -174,7 +197,7 @@ async function processForecastRow(
   row: ForecastRow,
   cache: ForecastCache,
   sourceFile: string,
-): Promise<ProcessedRow | ValidationError> {
+): Promise<ProcessedRow | ValidationError | null> {
   const sb = getSupabase()
   const emp = row.employee
 
@@ -187,6 +210,8 @@ async function processForecastRow(
     let subFuncId: string | null = null
     if (emp.subTeam) {
       const deptName = inferDepartment(emp.subTeam)
+      // Skip Central service line and LT sub-function — must not appear in tool.
+      if (isExcluded(deptName, emp.subTeam)) return null
       deptId = await resolveOrCreate('departments', 'name', deptName, cache.departments)
       const sfCacheKey = `${deptId}|${emp.subTeam}`
       if (cache.subFunctions.has(sfCacheKey)) {
@@ -206,7 +231,39 @@ async function processForecastRow(
     // 2. Upsert employee — must be done per-row to obtain UUID for allocation FK
     let empUuid: string
 
-    if (cache.employees.has(emp.employeeId)) {
+    // Reconciliation: if this row carries a real (non-synthetic) Employee ID
+    // and a previous upload created a PENDING- record for the same person
+    // (matched by name + DOJ), rename that record's employee_id in place.
+    // The UUID is preserved, so every forecast_allocations and allocations
+    // row already pointing at it stays correctly attributed — no historical
+    // data is lost when HR finally assigns the real ID.
+    const isSyntheticId = emp.employeeId.startsWith(`${PENDING_EMP_ID_PREFIX}-`)
+    const reconKey = !isSyntheticId && emp.doj
+      ? `${normalizeName(emp.name)}|${emp.doj}`
+      : null
+    const reconMatch = reconKey ? cache.pendingByNameDoj.get(reconKey) : undefined
+
+    if (reconMatch && !cache.employees.has(emp.employeeId)) {
+      empUuid = reconMatch.uuid
+      await sb.from('employees').update({
+        employee_id: emp.employeeId,
+        name: emp.name,
+        email: emp.email,
+        designation_id: desigId,
+        department_id: deptId,
+        sub_function_id: subFuncId,
+        location_id: locId,
+        work_mode: emp.workMode,
+        ft_core: emp.ftCore,
+        rocketlane_status: emp.rocketlane,
+        date_of_joining: emp.doj,
+        current_em_ep: emp.currentEmEp,
+        updated_at: new Date().toISOString(),
+      }).eq('id', empUuid)
+      cache.pendingByNameDoj.delete(reconKey!)
+      cache.employees.delete(reconMatch.pendingEmpId)
+      cache.employees.set(emp.employeeId, empUuid)
+    } else if (cache.employees.has(emp.employeeId)) {
       empUuid = cache.employees.get(emp.employeeId)!
       await sb.from('employees').update({
         name: emp.name,
@@ -219,6 +276,7 @@ async function processForecastRow(
         ft_core: emp.ftCore,
         rocketlane_status: emp.rocketlane,
         date_of_joining: emp.doj,
+        current_em_ep: emp.currentEmEp,
         updated_at: new Date().toISOString(),
       }).eq('id', empUuid)
     } else {
@@ -237,6 +295,7 @@ async function processForecastRow(
           ft_core: emp.ftCore,
           rocketlane_status: emp.rocketlane,
           date_of_joining: emp.doj,
+          current_em_ep: emp.currentEmEp,
         }, { onConflict: 'employee_id' })
         .select('id').single()
 
@@ -420,6 +479,8 @@ export async function ingestForecastFile(
       batch.map(row => processForecastRow(row, cache, fileName))
     )
     for (const result of results) {
+      // null means the row was intentionally skipped (e.g. Central service line / LT)
+      if (result === null) continue
       // ProcessedRow has empUuid; ValidationError has row/field/message
       if ('empUuid' in result) {
         successCount++
@@ -473,8 +534,13 @@ export async function ingestForecastFile(
   // 6c. Group non-project allocations into date ranges → upsert into `allocations`.
   //     This is the single source of truth for leave/available/jip/maternity ranges
   //     on the resource timeline (expanded back to weekly rows by the DB view).
+  //
+  //     The delete ALWAYS runs for affected employees within the sheet's week span,
+  //     even when the new upload has zero status rows.  Without this, old JIP/Leave
+  //     ranges from a previous upload survive a re-upload that removes those statuses,
+  //     causing stale entries to appear alongside the new project allocations.
   const allocationRanges = groupIntoRanges(allAllocationRows)
-  if (allocationRanges.length > 0 && allEmpUuids.size > 0 && parsed.weekColumns.length > 0) {
+  if (allEmpUuids.size > 0 && parsed.weekColumns.length > 0) {
     const minDate = parsed.weekColumns[0]
     const maxDate = parsed.weekColumns[parsed.weekColumns.length - 1]
     // Delete existing ranges for affected employees that overlap the sheet's span
@@ -485,18 +551,20 @@ export async function ingestForecastFile(
       .lte('start_date', maxDate)
       .gte('end_date', minDate)
 
-    // Upsert new ranges (idempotent on re-upload via unique index)
-    const { error: allocRangeErr } = await sb
-      .from('allocations')
-      .upsert(
-        allocationRanges.map(r => ({
-          ...r,
-          source_file: fileName,
-          updated_at: new Date().toISOString(),
-        })),
-        { onConflict: 'employee_id,type,start_date' },
-      )
-    if (allocRangeErr) throw new Error(`Allocation ranges upsert failed: ${allocRangeErr.message}`)
+    // Upsert new ranges only when there are any to insert
+    if (allocationRanges.length > 0) {
+      const { error: allocRangeErr } = await sb
+        .from('allocations')
+        .upsert(
+          allocationRanges.map(r => ({
+            ...r,
+            source_file: fileName,
+            updated_at: new Date().toISOString(),
+          })),
+          { onConflict: 'employee_id,type,start_date' },
+        )
+      if (allocRangeErr) throw new Error(`Allocation ranges upsert failed: ${allocRangeErr.message}`)
+    }
   }
 
   // 7. Bulk upsert all utilization snapshots in one call
