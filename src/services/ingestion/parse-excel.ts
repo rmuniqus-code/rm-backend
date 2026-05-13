@@ -213,7 +213,7 @@ export function parseExcelBuffer(
 
 // ─── Detect File Type ────────────────────────────────────────
 
-export type FileType = 'timesheet_compliance' | 'regionwise' | 'unknown'
+export type FileType = 'timesheet_compliance' | 'regionwise' | 'rms' | 'unknown'
 
 export function detectFileType(headers: string[]): FileType {
   const headerSet = new Set(headers)

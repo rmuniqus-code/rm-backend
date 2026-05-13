@@ -162,6 +162,37 @@ function actor(req: AuthedRequest): { userName: string } {
   return { userName: req.user?.name ?? req.user?.email ?? 'system' }
 }
 
+// ── Project code generation ───────────────────────────────────────────
+const SL_PREFIX_MAP: Record<string, string> = {
+  ARC: 'ARC', ADVISORY: 'ADV', CONSULTING: 'CON', TAX: 'TAX',
+  TECHNOLOGY: 'TCH', GRC: 'GRC', SCC: 'SCC', AUDIT: 'ARC',
+  FORENSICS: 'FOR', RISK: 'RSK',
+}
+
+function serviceLinePrefix(hint: string): string {
+  const h = (hint ?? '').trim().toUpperCase()
+  for (const [key, code] of Object.entries(SL_PREFIX_MAP)) {
+    if (h.startsWith(key) || h.includes(key)) return code
+  }
+  const clean = h.replace(/[^A-Z]/g, '')
+  return (clean.slice(0, 3) || 'GEN').padEnd(3, 'X')
+}
+
+async function generateProjectCode(serviceLineHint: string): Promise<string> {
+  const year = new Date().getFullYear()
+  const prefix = serviceLinePrefix(serviceLineHint)
+  const { data } = await supabaseAdmin()
+    .from('projects')
+    .select('code')
+    .like('code', `%-${year}-%`)
+  const maxSeq = (data ?? []).reduce((max: number, p: { code: string | null }) => {
+    const parts = (p.code ?? '').split('-')
+    const seq = parts.length >= 3 ? (parseInt(parts[parts.length - 1]) || 0) : 0
+    return Math.max(max, seq)
+  }, 0)
+  return `${prefix}-${year}-${String(maxSeq + 1).padStart(3, '0')}`
+}
+
 // ── POST /create ───────────────────────────────────────────────────────
 // body: { empCode | employeeId, projectName | projectId | null,
 //         weekStarts: string[], allocationPct?, allocationStatus? }
@@ -176,16 +207,28 @@ allocationsRouter.post('/create', asyncHandler(async (req: AuthedRequest, res) =
     return res.status(400).json({ error: `invalid allocationStatus: ${status}` })
   }
   const pct = Number(body.allocationPct ?? 100)
-  if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
-    return res.status(400).json({ error: 'allocationPct must be 0–100' })
+  if (!Number.isFinite(pct) || pct < 0) {
+    return res.status(400).json({ error: 'allocationPct must be 0 or greater' })
   }
 
   const employeeId = await resolveEmployeeId({ id: body.employeeId, empCode: body.empCode })
   if (!employeeId) return res.status(404).json({ error: 'employee not found' })
 
-  const projectId = await resolveProjectId({ id: body.projectId ?? null, name: body.projectName ?? null })
+  let projectId = await resolveProjectId({ id: body.projectId ?? null, name: body.projectName ?? null })
   if ((body.projectName || body.projectId) && !projectId) {
-    return res.status(404).json({ error: 'project not found' })
+    if (body.autoCreateProject && body.projectName) {
+      // Auto-create a new project with a generated dummy code
+      const code = await generateProjectCode(body.serviceLineHint ?? '')
+      const { data: newProj, error: createErr } = await supabaseAdmin()
+        .from('projects')
+        .insert({ name: body.projectName.trim(), code, status: 'active', sub_team: body.serviceLineHint ?? null })
+        .select('id')
+        .single()
+      if (createErr) return res.status(500).json({ error: createErr.message })
+      projectId = (newProj as { id: string }).id
+    } else {
+      return res.status(404).json({ error: 'project not found' })
+    }
   }
 
   const sb = supabaseAdmin()
@@ -279,7 +322,7 @@ allocationsRouter.post('/update', asyncHandler(async (req: AuthedRequest, res) =
   const next: Record<string, unknown> = { updated_at: new Date().toISOString() }
   if (patch.allocationPct !== undefined) {
     const n = Number(patch.allocationPct)
-    if (!Number.isFinite(n) || n < 0 || n > 100) return res.status(400).json({ error: 'allocationPct must be 0–100' })
+    if (!Number.isFinite(n) || n < 0) return res.status(400).json({ error: 'allocationPct must be 0 or greater' })
     next.allocation_pct = n
   }
   if (patch.allocationStatus !== undefined) {
@@ -353,8 +396,29 @@ allocationsRouter.post('/update', asyncHandler(async (req: AuthedRequest, res) =
   res.json({ allocation: updated })
 }))
 
+// ── Day-mask helpers ───────────────────────────────────────────────────
+
+/** Return the Monday (week-start) for any ISO date string using local time. */
+function toMondayISO(iso: string): string {
+  const d = new Date(iso + 'T00:00:00')
+  const dow = d.getDay() // 0=Sun … 6=Sat
+  const diff = dow === 0 ? -6 : 1 - dow
+  d.setDate(d.getDate() + diff)
+  return safeISODate(d)
+}
+
+/** bit position for Mon=0 … Fri=4 */
+function dayBit(iso: string): number {
+  const dow = new Date(iso + 'T00:00:00').getDay() // 1=Mon … 5=Fri
+  if (dow < 1 || dow > 5) return 0  // weekends: no bit
+  return 1 << (dow - 1)
+}
+
 // ── POST /delete ───────────────────────────────────────────────────────
-// body: { id?, empCode?, projectName?, weekStarts?: string[] }
+// body: { id?, empCode?, projectName?, weekStarts?: string[], dates?: string[] }
+// `weekStarts` → delete entire week rows (existing behaviour)
+// `dates`      → remove specific days from their week rows via days_mask;
+//                delete the row when days_mask reaches 0
 allocationsRouter.post('/delete', asyncHandler(async (req: AuthedRequest, res) => {
   const body = req.body ?? {}
   const sb = supabaseAdmin()
@@ -400,6 +464,70 @@ allocationsRouter.post('/delete', asyncHandler(async (req: AuthedRequest, res) =
 
   const employeeId = await resolveEmployeeId({ empCode: body.empCode })
   if (!employeeId) return res.status(404).json({ error: 'employee not found' })
+
+  // ── Day-level delete path ────────────────────────────────────────────
+  if (Array.isArray(body.dates) && body.dates.length > 0) {
+    const dates: string[] = body.dates
+    const projectId = body.projectName !== undefined
+      ? await resolveProjectId({ name: body.projectName })
+      : undefined
+
+    // Group dates by their Monday week-start
+    const byWeek = new Map<string, number>()  // weekStart → combined bits to clear
+    for (const d of dates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue
+      const monday = toMondayISO(d)
+      const bit = dayBit(d)
+      if (!bit) continue
+      byWeek.set(monday, (byWeek.get(monday) ?? 0) | bit)
+    }
+
+    if (byWeek.size === 0) return res.json({ deleted: 0 })
+
+    let totalDeleted = 0
+    const empName = await fetchEmployeeName(employeeId)
+    const projDisplay = body.projectName ?? '(all projects)'
+
+    for (const [monday, clearBits] of byWeek.entries()) {
+      let q = sb.from('forecast_allocations')
+        .select('id,days_mask')
+        .eq('employee_id', employeeId)
+        .eq('week_start', monday)
+      if (projectId !== undefined) q = projectId ? q.eq('project_id', projectId) : q.is('project_id', null)
+
+      const { data: rows, error: fetchErr } = await q
+      if (fetchErr || !rows) continue
+
+      for (const row of rows as { id: string; days_mask: number | null }[]) {
+        const currentMask = row.days_mask ?? 31
+        const newMask = currentMask & ~clearBits & 0x1f  // clear bits, keep 5-bit range
+
+        if (newMask === 0) {
+          await sb.from('forecast_allocations').delete().eq('id', row.id)
+          totalDeleted++
+        } else if (newMask !== currentMask) {
+          await sb.from('forecast_allocations').update({ days_mask: newMask }).eq('id', row.id)
+          totalDeleted++
+        }
+      }
+    }
+
+    const sortedDates = [...dates].sort()
+    await logAudit({
+      ...actor(req),
+      action: 'Deleted',
+      entity: 'Allocation',
+      entityName: allocationLabel(empName, projDisplay),
+      entityId: employeeId,
+      field: 'allocation',
+      newValue: `removed ${dates.length} day${dates.length !== 1 ? 's' : ''} (${sortedDates[0]}${dates.length > 1 ? ` – ${sortedDates.at(-1)}` : ''})`,
+      metadata: { employee: empName, project: projDisplay, dates: sortedDates },
+    })
+
+    return res.json({ deleted: totalDeleted })
+  }
+
+  // ── Week-level delete path (existing) ───────────────────────────────
   const weekStarts: string[] = Array.isArray(body.weekStarts) ? body.weekStarts : []
   if (weekStarts.length === 0 || !weekStarts.every(isIsoMonday)) {
     return res.status(400).json({ error: 'weekStarts must be ISO Monday dates' })

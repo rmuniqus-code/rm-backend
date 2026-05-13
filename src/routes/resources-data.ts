@@ -10,7 +10,7 @@ import { normalizeSubFunction, isExcluded } from '../utils/sub-function-normaliz
 
 const SELECT_COLS =
   'emp_code,employee_name,designation,department,sub_function,location,' +
-  'week_start,allocation_pct,allocation_status,project_name,project_client,project_type,engagement_manager,current_em_ep'
+  'week_start,allocation_pct,allocation_status,project_name,project_client,project_type,engagement_manager,current_em_ep,raw_text'
 
 const PAGE_SIZE = 1000
 
@@ -100,7 +100,7 @@ resourcesDataRouter.get('/', asyncHandler(async (req, res) => {
   const [{ data: skillRows }, { data: empMetaRows }] = await Promise.all([
     sb.from('v_employee_skills').select('emp_code,primary_skill,secondary_skills'),
     sb.from('v_employee_details')
-      .select('emp_code,region,department,sub_function')
+      .select('emp_code,region,department,sub_function,employee_status')
       .eq('is_active', true),
   ])
 
@@ -114,13 +114,14 @@ resourcesDataRouter.get('/', asyncHandler(async (req, res) => {
     }
   }
 
-  const empRegionMap: Record<string, { region: string; department: string; subFunction: string }> = {}
+  const empRegionMap: Record<string, { region: string; department: string; subFunction: string; employeeStatus: string }> = {}
   for (const row of empMetaRows ?? []) {
     if (row.emp_code && !isExcluded(row.department, row.sub_function)) {
       empRegionMap[row.emp_code] = {
         region: row.region ?? '',
         department: row.department ?? '',
         subFunction: normalizeSubFunction(row.sub_function ?? ''),
+        employeeStatus: row.employee_status ?? '',
       }
     }
   }

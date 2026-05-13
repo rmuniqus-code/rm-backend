@@ -50,6 +50,8 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     overviewRes,
     employeeCountRes,
     exitedCountRes,
+    servingNoticeCountRes,
+    contractCountRes,
     chargeRes,
     empRes,
     overAllocRes,
@@ -61,6 +63,7 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     empChargeRes,
     currentAllocRes,
     regionChargeRes,
+    deptStatusRes,
   ] = await Promise.all([
     overviewQuery,
     sb.from('employees')
@@ -69,6 +72,12 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     sb.from('employees')
       .select('*', { count: 'exact', head: true })
       .eq('is_active', false),
+    sb.from('employees')
+      .select('*', { count: 'exact', head: true })
+      .eq('employee_status', 'Serving notice period'),
+    sb.from('employees')
+      .select('*', { count: 'exact', head: true })
+      .eq('employee_status', 'Contract'),
     sb.from('v_chargeability_by_dept')
       .select('*')
       .order('period_month', { ascending: false }),
@@ -145,11 +154,16 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     sb.from('v_chargeability_by_region')
       .select('region, period_month, headcount, avg_chargeability, avg_compliance')
       .order('period_month', { ascending: false }),
+    // Per-department + sub-function status breakdown (all employees, for Active Resources modal)
+    sb.from('v_employee_details')
+      .select('department, sub_function, is_active, employee_status'),
   ])
 
   const overview = overviewRes.data
   const totalEmployees = employeeCountRes.count ?? 0
   const exitedCount = exitedCountRes.count ?? 0
+  const servingNoticeCount = servingNoticeCountRes.count
+  const contractCount = contractCountRes.count
   // Filter out excluded departments (Central) and sub-functions (LT) from all raw data
   const chargeRows = (chargeRes.data ?? []).filter((r: any) => !isExcluded(r.department))
   const empRows = (empRes.data ?? []).filter((r: any) => !isExcluded(r.department, r.sub_function))
@@ -232,10 +246,6 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     ? Number(((ytdRows.reduce((s, r) => s + (Number(r.chargeability_pct) || 0), 0) / ytdRows.length) * 100).toFixed(1))
     : 0
 
-  // Employment-status counts for the Active Resources card.
-  // Serving Notice / Contract require a schema change and are returned as null placeholders for the UI.
-  const activeResourcesCount = totalEmployees
-
   const kpi = {
     totalCapacity: totalEmployees,
     forecastedFte: (overview as any)?.total_employees ?? 0,
@@ -248,20 +258,21 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     variance: overview
       ? Number((Number((overview as any).avg_chargeability) - Number((overview as any).avg_compliance)).toFixed(1))
       : 0,
-    activeResources: activeResourcesCount,
-    servingNotice: null as number | null,   // pending schema addition
-    contract: null as number | null,        // pending schema addition
+    activeResources: totalEmployees,
+    servingNotice: servingNoticeCount,
+    contract: contractCount,
     exited: exitedCount,
   }
 
   // Department-level chargeability / compliance (includes headcount from the view)
-  type DeptAgg = { current: number; previous: number; headcount: number }
+  const currentYearStr = String(new Date().getUTCFullYear())
+  type DeptAgg = { current: number; previous: number; headcount: number; ytdChargeTotal: number; ytdChargeN: number; ytdCompTotal: number; ytdCompN: number }
   const chargeByDept = new Map<string, DeptAgg>()
   const compByDept = new Map<string, DeptAgg>()
   for (const r of chargeRows as any[]) {
     const dept = r.department
-    if (!chargeByDept.has(dept)) chargeByDept.set(dept, { current: 0, previous: 0, headcount: 0 })
-    if (!compByDept.has(dept)) compByDept.set(dept, { current: 0, previous: 0, headcount: 0 })
+    if (!chargeByDept.has(dept)) chargeByDept.set(dept, { current: 0, previous: 0, headcount: 0, ytdChargeTotal: 0, ytdChargeN: 0, ytdCompTotal: 0, ytdCompN: 0 })
+    if (!compByDept.has(dept)) compByDept.set(dept, { current: 0, previous: 0, headcount: 0, ytdChargeTotal: 0, ytdChargeN: 0, ytdCompTotal: 0, ytdCompN: 0 })
     const cur = r.period_month === currentPeriod
     const prev = r.period_month === previousPeriod
     if (cur) {
@@ -274,12 +285,24 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
       chargeByDept.get(dept)!.previous = Number(Number(r.avg_chargeability).toFixed(1)) || 0
       compByDept.get(dept)!.previous = Number(Number(r.avg_compliance).toFixed(1)) || 0
     }
+    if (String(r.period_month).includes(currentYearStr)) {
+      chargeByDept.get(dept)!.ytdChargeTotal += Number(r.avg_chargeability) || 0
+      chargeByDept.get(dept)!.ytdChargeN++
+      compByDept.get(dept)!.ytdCompTotal += Number(r.avg_compliance) || 0
+      compByDept.get(dept)!.ytdCompN++
+    }
   }
   const chargeability = [...chargeByDept.entries()].map(
-    ([department, { current, previous, headcount }]) => ({ department, headcount, current, previous }),
+    ([department, { current, previous, headcount, ytdChargeTotal, ytdChargeN }]) => ({
+      department, headcount, current, previous,
+      ytd: ytdChargeN > 0 ? Number((ytdChargeTotal / ytdChargeN).toFixed(1)) : null,
+    }),
   )
   const compliance = [...compByDept.entries()].map(
-    ([department, { current, previous, headcount }]) => ({ department, headcount, current, previous }),
+    ([department, { current, previous, headcount, ytdCompTotal, ytdCompN }]) => ({
+      department, headcount, current, previous,
+      ytd: ytdCompN > 0 ? Number((ytdCompTotal / ytdCompN).toFixed(1)) : null,
+    }),
   )
 
   // Sub-team-level chargeability / compliance (department + sub_function)
@@ -302,10 +325,12 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
   }
 
   // Seed every (dept, sub_function) pair that has at least one active employee.
+  // Fall back to department name when sub_function is empty so dept-level data
+  // still appears in the drilldown (e.g. GRC employees with no explicit sub-function).
   const subMap = new Map<string, SubAgg>()
   for (const emp of empRows as any[]) {
     const dept = emp.department ?? ''
-    const sub = normalizeSubFunction(emp.sub_function ?? '')
+    const sub = normalizeSubFunction(emp.sub_function ?? '') || dept
     if (!dept || !sub) continue
     const key = `${dept}|${sub}`
     if (!subMap.has(key)) {
@@ -326,7 +351,7 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
   // Fill in chargeability/compliance averages from timesheet data
   for (const r of (tcSubTeamRes.data ?? []) as any[]) {
     const dept = r.employees?.departments?.name ?? 'Unknown'
-    const sub = normalizeSubFunction(r.employees?.sub_functions?.name ?? '')
+    const sub = normalizeSubFunction(r.employees?.sub_functions?.name ?? '') || dept
     if (!sub) continue
     if (isExcluded(dept, sub)) continue
     const key = `${dept}|${sub}`
@@ -352,20 +377,37 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     te.compTotal += comp; te.compN++
   }
   const toPct = (total: number, n: number) => n > 0 ? Number(((total / n) * 100).toFixed(1)) : 0
-  const chargeabilityBySubTeam = [...subMap.values()].map(e => ({
-    department: e.department,
-    subTeam: e.subTeam,
-    headcount: e.headcount,
-    current: toPct(e.currentTotal, e.currentN),
-    previous: toPct(e.previousTotal, e.previousN),
-  })).sort((a, b) => a.department.localeCompare(b.department) || a.subTeam.localeCompare(b.subTeam))
-  const complianceBySubTeam = [...subMap.values()].map(e => ({
-    department: e.department,
-    subTeam: e.subTeam,
-    headcount: e.headcount,
-    current: toPct(e.complianceCurrentTotal, e.complianceCurrentN),
-    previous: toPct(e.compliancePreviousTotal, e.compliancePreviousN),
-  })).sort((a, b) => a.department.localeCompare(b.department) || a.subTeam.localeCompare(b.subTeam))
+  const chargeabilityBySubTeam = [...subMap.values()].map(e => {
+    let ytdTotal = 0, ytdN = 0, ytdCompTotal = 0, ytdCompN = 0
+    for (const [period, te] of e.trendMap.entries()) {
+      if (!String(period).includes(currentYearStr)) continue
+      if (te.chargeN > 0) { ytdTotal += te.chargeTotal / te.chargeN; ytdN++ }
+      if (te.compN > 0)   { ytdCompTotal += te.compTotal / te.compN; ytdCompN++ }
+    }
+    return {
+      department: e.department,
+      subTeam: e.subTeam,
+      headcount: e.headcount,
+      current:  toPct(e.currentTotal, e.currentN),
+      previous: toPct(e.previousTotal, e.previousN),
+      ytd:      ytdN > 0 ? Number(((ytdTotal / ytdN) * 100).toFixed(1)) : null,
+    }
+  }).sort((a, b) => a.department.localeCompare(b.department) || a.subTeam.localeCompare(b.subTeam))
+  const complianceBySubTeam = [...subMap.values()].map(e => {
+    let ytdCompTotal = 0, ytdCompN = 0
+    for (const [period, te] of e.trendMap.entries()) {
+      if (!String(period).includes(currentYearStr)) continue
+      if (te.compN > 0) { ytdCompTotal += te.compTotal / te.compN; ytdCompN++ }
+    }
+    return {
+      department: e.department,
+      subTeam: e.subTeam,
+      headcount: e.headcount,
+      current:  toPct(e.complianceCurrentTotal, e.complianceCurrentN),
+      previous: toPct(e.compliancePreviousTotal, e.compliancePreviousN),
+      ytd:      ytdCompN > 0 ? Number(((ytdCompTotal / ytdCompN) * 100).toFixed(1)) : null,
+    }
+  }).sort((a, b) => a.department.localeCompare(b.department) || a.subTeam.localeCompare(b.subTeam))
 
   // Yearly trend: per (dept, sub-team) and per dept, all months in look-back window
   const chargeabilityTrendBySubTeam = [...subMap.values()].map(e => ({
@@ -476,6 +518,7 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
       location: e.location ?? '',
       region: e.region ?? '',
       dateOfJoining: e.date_of_joining ?? '',
+      employeeStatus: e.employee_status ?? '',
       status: e.is_active ? 'green' : 'red',
       // JIP employees are not on billable work — show 0% utilization
       chargeabilityMTD: isJip ? 0 : (chargeEntry?.mtd ?? null),
@@ -590,6 +633,39 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     headcount: v.currentHC,
   }))
 
+  // Per-department + sub-function workforce status breakdown for the Active Resources modal
+  type StatusCounts = { active: number; exited: number; servingNotice: number; contract: number }
+  const deptStatusMap = new Map<string, StatusCounts>()
+  const subTeamStatusMap = new Map<string, StatusCounts>()  // key: "dept|subTeam"
+
+  function bumpStatus(map: Map<string, StatusCounts>, key: string, status: string, isActive: boolean) {
+    if (!map.has(key)) map.set(key, { active: 0, exited: 0, servingNotice: 0, contract: 0 })
+    const agg = map.get(key)!
+    if (status === 'Serving notice period') agg.servingNotice++
+    else if (status === 'Contract') agg.contract++
+    else if (isActive) agg.active++
+    else agg.exited++
+  }
+
+  for (const r of (deptStatusRes.data ?? []) as any[]) {
+    const dept = r.department ?? ''
+    const sub = normalizeSubFunction(r.sub_function ?? '') || dept
+    if (!dept || isExcluded(dept, r.sub_function)) continue
+    const status: string = r.employee_status ?? ''
+    const isActive: boolean = r.is_active === true
+    bumpStatus(deptStatusMap, dept, status, isActive)
+    bumpStatus(subTeamStatusMap, `${dept}|${sub}`, status, isActive)
+  }
+
+  const deptStatusBreakdown = [...deptStatusMap.entries()].map(([department, counts]) => ({
+    department,
+    ...counts,
+    subTeams: [...subTeamStatusMap.entries()]
+      .filter(([k]) => k.startsWith(`${department}|`))
+      .map(([k, c]) => ({ subTeam: k.slice(department.length + 1), ...c }))
+      .sort((a, b) => a.subTeam.localeCompare(b.subTeam)),
+  })).sort((a, b) => a.department.localeCompare(b.department))
+
   res.json({
     kpi,
     chargeability,
@@ -613,5 +689,6 @@ dashboardDataRouter.get('/', asyncHandler(async (req, res) => {
     chargeabilityTrendBySubTeam,
     complianceTrendByDept,
     complianceTrendBySubTeam,
+    deptStatusBreakdown,
   })
 }))

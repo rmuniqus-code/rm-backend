@@ -45,6 +45,7 @@ resourceRequestsRouter.get('/', asyncHandler(async (req, res) => {
       opportunity_id, skill_set, travel_requirements, project_status,
       loading_pct, em_ep_name, lifecycle_status,
       service_line, sub_service_line,
+      em_approved_resource_id, em_approved_at, em_approval_notes,
       project:projects(id, name, client, code, zoho_project_id),
       requester:employees!resource_requests_requested_by_fkey(id, name, employee_id)
     `, { count: 'exact' })
@@ -262,6 +263,8 @@ resourceRequestsRouter.delete('/:id', asyncHandler(async (req: AuthedRequest, re
 }))
 
 // ── POST /:id/approve ─────────────────────────────────────────
+// Final approval by the RM — only allowed once the EM/EP has given first approval.
+// Rejects can happen at any stage.
 resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedRequest, res) => {
   const id = req.params.id
   const body = req.body ?? {}
@@ -280,6 +283,14 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
     .single()
 
   if (fetchErr || !request) return res.status(404).json({ error: 'Request not found' })
+
+  // Enforce workflow: final approval only allowed after EM/EP has reviewed
+  if (decision === 'approved' && request.approval_status !== 'em_approved') {
+    return res.status(400).json({
+      error: `Cannot approve — request must be in 'em_approved' status (currently '${request.approval_status}'). ` +
+             `Follow the workflow: shortlist resources → EM/EP review → final approval.`,
+    })
+  }
 
   const projectName = (request as any).project?.name ?? 'Unknown Project'
 
@@ -310,6 +321,8 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
     return res.json({ request: { ...request, approval_status: 'rejected', lifecycle_status: 'rejected' }, allocationsCreated: 0 })
   }
 
+  // For em_approved requests, the resource is already set by the EM/EP;
+  // fall back to resource_requested (which is updated when EM/EP approves).
   const allocatedName = body.allocated_employee
     ? String(body.allocated_employee).trim()
     : request.resource_requested
@@ -451,9 +464,8 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
 }))
 
 // ── POST /:id/shortlist ───────────────────────────────────────
-// Mark a candidate against a request without yet creating allocations.
-// Use this when the RM wants to pencil someone in before confirming a booking
-// (R2 — "shortlist resource as an option — directly gets booked on the tool").
+// RM submits a list of shortlisted candidates for EM/EP review.
+// Body: { resources: [{ employee_id?, employee_name, grade?, service_line?, utilization_pct?, fit_score? }] }
 resourceRequestsRouter.post('/:id/shortlist', asyncHandler(async (req: AuthedRequest, res) => {
   const id = req.params.id
   const body = req.body ?? {}
@@ -466,14 +478,65 @@ resourceRequestsRouter.post('/:id/shortlist', asyncHandler(async (req: AuthedReq
     .single()
   if (fetchErr || !before) return res.status(404).json({ error: 'Request not found' })
 
-  const resourceName = (body.resource_name ?? body.resource_requested ?? null) as string | null
+  if (!['pending', 'shortlisted'].includes(before.approval_status ?? '')) {
+    return res.status(400).json({
+      error: `Cannot shortlist — request is already in '${before.approval_status}' status.`,
+    })
+  }
+
+  const resources: Array<{
+    employee_id?: string
+    employee_name: string
+    grade?: string
+    service_line?: string
+    sub_service_line?: string
+    location?: string
+    utilization_pct?: number
+    fit_score?: number
+    notes?: string
+  }> = body.resources ?? []
+
+  if (resources.length === 0) {
+    return res.status(400).json({ error: 'At least one shortlisted resource is required' })
+  }
+
+  // Upsert shortlisted resources — replace previous shortlist if re-submitting
+  await sb.from('request_shortlisted_resources').delete().eq('request_id', id)
+
+  // Resolve any emp_code strings (non-UUID) to their actual UUID
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+  const resolvedResources = await Promise.all(resources.map(async r => {
+    let empId = r.employee_id ?? null
+    if (empId && !UUID_RE.test(empId)) {
+      const { data } = await sb.from('employees').select('id').eq('employee_id', empId).maybeSingle()
+      empId = data?.id ?? null
+    }
+    return { ...r, employee_id: empId }
+  }))
+
+  const rows = resolvedResources.map(r => ({
+    request_id: id,
+    employee_id: r.employee_id ?? null,
+    employee_name: r.employee_name,
+    grade: r.grade ?? null,
+    service_line: r.service_line ?? null,
+    sub_service_line: r.sub_service_line ?? null,
+    location: r.location ?? null,
+    utilization_pct: r.utilization_pct ?? null,
+    fit_score: r.fit_score ?? null,
+    shortlisted_by: req.user?.name ?? 'RM',
+    notes: r.notes ?? null,
+    status: 'shortlisted',
+  }))
+
+  const { error: insertErr } = await sb.from('request_shortlisted_resources').insert(rows)
+  if (insertErr) return res.status(500).json({ error: insertErr.message })
 
   const { data: updated, error: updateErr } = await sb
     .from('resource_requests')
     .update({
       approval_status: 'shortlisted',
-      resource_requested: resourceName ?? before.resource_requested,
-      notes: body.notes ?? before.notes,
+      lifecycle_status: 'under_review',
       updated_at: new Date().toISOString(),
     })
     .eq('id', id)
@@ -491,10 +554,94 @@ resourceRequestsRouter.post('/:id/shortlist', asyncHandler(async (req: AuthedReq
     field: 'approval_status',
     oldValue: before.approval_status ?? 'pending',
     newValue: 'shortlisted',
-    metadata: resourceName ? { shortlisted_resource: resourceName } : undefined,
+    metadata: { shortlisted_count: resources.length, resources: resources.map(r => r.employee_name) },
   })
 
-  res.json({ request: updated })
+  res.json({ request: updated, shortlisted: rows.length })
+}))
+
+// ── GET /:id/shortlisted-resources ───────────────────────────
+// Returns all shortlisted candidates for a request (for EM/EP review).
+resourceRequestsRouter.get('/:id/shortlisted-resources', asyncHandler(async (req, res) => {
+  const id = req.params.id
+  const { data, error } = await supabaseAdmin()
+    .from('request_shortlisted_resources')
+    .select('*')
+    .eq('request_id', id)
+    .order('fit_score', { ascending: false })
+
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ data: data ?? [] })
+}))
+
+// ── POST /:id/em-approve ──────────────────────────────────────
+// EM/EP selects one shortlisted resource as their first approval.
+// Body: { shortlisted_resource_id: UUID, notes?: string }
+resourceRequestsRouter.post('/:id/em-approve', asyncHandler(async (req: AuthedRequest, res) => {
+  const id = req.params.id
+  const body = req.body ?? {}
+  const sb = supabaseAdmin()
+
+  if (!body.shortlisted_resource_id) {
+    return res.status(400).json({ error: 'shortlisted_resource_id is required' })
+  }
+
+  const { data: shortlisted, error: slErr } = await sb
+    .from('request_shortlisted_resources')
+    .select('*')
+    .eq('id', body.shortlisted_resource_id)
+    .eq('request_id', id)
+    .single()
+
+  if (slErr || !shortlisted) {
+    return res.status(404).json({ error: 'Shortlisted resource not found for this request' })
+  }
+
+  const { data: request, error: reqErr } = await sb
+    .from('resource_requests')
+    .select('*, project:projects(name)')
+    .eq('id', id)
+    .single()
+  if (reqErr || !request) return res.status(404).json({ error: 'Request not found' })
+
+  // Mark the selected resource and update others
+  await sb.from('request_shortlisted_resources')
+    .update({ status: 'em_selected' })
+    .eq('id', body.shortlisted_resource_id)
+
+  // Update request: set em_approved_resource_id, change status
+  const { data: updated, error: updateErr } = await sb
+    .from('resource_requests')
+    .update({
+      approval_status: 'em_approved',
+      em_approved_resource_id: shortlisted.employee_id ?? null,
+      resource_requested: shortlisted.employee_name,
+      em_approved_at: new Date().toISOString(),
+      em_approval_notes: body.notes ?? null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .select()
+    .single()
+  if (updateErr) return res.status(500).json({ error: updateErr.message })
+
+  const projectName = (request as any).project?.name ?? 'Unknown Project'
+  logAudit({
+    action: 'Updated',
+    entity: 'Request',
+    entityName: `#${request.request_number} — ${projectName}`,
+    entityId: id,
+    userName: req.user?.name ?? 'System',
+    field: 'approval_status',
+    oldValue: 'shortlisted',
+    newValue: 'em_approved',
+    metadata: {
+      selected_resource: shortlisted.employee_name,
+      em_notes: body.notes ?? null,
+    },
+  })
+
+  res.json({ request: updated, selectedResource: shortlisted })
 }))
 
 // ── POST /:id/undo ───────────────────────────────────────────

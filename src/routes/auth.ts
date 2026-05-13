@@ -48,6 +48,55 @@ authRouter.post('/register', asyncHandler(async (req, res) => {
   })
 }))
 
+// ── Admin: list all users ──────────────────────────────────────
+adminRouter.get(
+  '/users',
+  requireAuth,
+  asyncHandler(async (req: AuthedRequest, res) => {
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' })
+    }
+
+    const { data, error } = await supabaseAdmin().auth.admin.listUsers({ perPage: 1000 })
+    if (error) return res.status(500).json({ error: error.message })
+
+    const users = (data?.users ?? []).map(u => ({
+      id: u.id,
+      email: u.email ?? '',
+      name: (u.user_metadata?.name as string | undefined) ?? u.email ?? '',
+      role: (u.app_metadata?.role as string | undefined) ?? 'employee',
+      lastSignIn: u.last_sign_in_at ?? null,
+      createdAt: u.created_at ?? null,
+      confirmed: !!u.email_confirmed_at,
+    }))
+
+    return res.json({ users })
+  }),
+)
+
+// ── Admin: update a user's role ───────────────────────────────
+adminRouter.put(
+  '/users/:userId/role',
+  requireAuth,
+  asyncHandler(async (req: AuthedRequest, res) => {
+    if (req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' })
+    }
+    const { userId } = req.params
+    const { role } = req.body as { role?: string }
+    if (!role || !VALID_ROLES.has(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${[...VALID_ROLES].join(', ')}` })
+    }
+
+    const { error } = await supabaseAdmin().auth.admin.updateUserById(userId, {
+      app_metadata: { role },
+    })
+    if (error) return res.status(500).json({ error: error.message })
+
+    return res.json({ success: true, userId, role })
+  }),
+)
+
 // ── Admin: create user with specified role, sends invite email ──
 adminRouter.post(
   '/create-user',

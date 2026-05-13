@@ -1,5 +1,9 @@
 /**
- * GET /api/projects — ported from app/api/projects/route.ts.
+ * /api/projects — project management endpoints.
+ *
+ * GET  /              — list all projects (ported from app/api/projects/route.ts)
+ * POST /              — create a new project with an auto-generated dummy code
+ * GET  /code-preview  — preview the code that would be generated for a service line
  */
 
 import { Router } from 'express'
@@ -7,6 +11,74 @@ import { supabaseAdmin } from '../db/supabase-admin'
 import { asyncHandler } from '../middleware/error'
 
 export const projectsRouter = Router()
+
+// ── Service-line prefix helper ────────────────────────────────────────
+const SL_PREFIX_MAP: Record<string, string> = {
+  ARC: 'ARC', ADVISORY: 'ADV', CONSULTING: 'CON', TAX: 'TAX',
+  TECHNOLOGY: 'TCH', GRC: 'GRC', SCC: 'SCC', AUDIT: 'ARC',
+  FORENSICS: 'FOR', RISK: 'RSK',
+}
+
+function serviceLinePrefix(hint: string): string {
+  const h = (hint ?? '').trim().toUpperCase()
+  for (const [key, code] of Object.entries(SL_PREFIX_MAP)) {
+    if (h.startsWith(key) || h.includes(key)) return code
+  }
+  const clean = h.replace(/[^A-Z]/g, '')
+  return (clean.slice(0, 3) || 'GEN').padEnd(3, 'X')
+}
+
+async function generateProjectCode(serviceLineHint: string): Promise<string> {
+  const year = new Date().getFullYear()
+  const prefix = serviceLinePrefix(serviceLineHint)
+  const { data } = await supabaseAdmin()
+    .from('projects')
+    .select('code')
+    .like('code', `%-${year}-%`)
+  const maxSeq = (data ?? []).reduce((max: number, p: { code: string | null }) => {
+    const parts = (p.code ?? '').split('-')
+    const seq = parts.length >= 3 ? (parseInt(parts[parts.length - 1]) || 0) : 0
+    return Math.max(max, seq)
+  }, 0)
+  return `${prefix}-${year}-${String(maxSeq + 1).padStart(3, '0')}`
+}
+
+// ── POST / — create a project with an auto-generated dummy code ───────
+projectsRouter.post('/', asyncHandler(async (req, res) => {
+  const { name, serviceLineHint, subTeam, client, projectType } = req.body ?? {}
+  if (!name?.trim()) return res.status(400).json({ error: 'name is required' })
+
+  // Check for duplicate name
+  const { data: existing } = await supabaseAdmin()
+    .from('projects')
+    .select('id, code, name')
+    .ilike('name', name.trim())
+    .maybeSingle()
+  if (existing) return res.json({ project: existing, existed: true })
+
+  const code = await generateProjectCode(serviceLineHint ?? subTeam ?? '')
+  const { data: project, error } = await supabaseAdmin()
+    .from('projects')
+    .insert({
+      name: name.trim(),
+      code,
+      status: 'active',
+      sub_team: subTeam ?? serviceLineHint ?? null,
+      client: client ?? null,
+      project_type: projectType ?? 'chargeable',
+    })
+    .select('id, code, name')
+    .single()
+  if (error) return res.status(500).json({ error: error.message })
+  res.status(201).json({ project, existed: false })
+}))
+
+// ── GET /code-preview — peek at the next code without creating ────────
+projectsRouter.get('/code-preview', asyncHandler(async (req, res) => {
+  const hint = (req.query.hint as string) ?? ''
+  const code = await generateProjectCode(hint)
+  res.json({ code })
+}))
 
 projectsRouter.get('/', asyncHandler(async (req, res) => {
   const status = req.query.status as string | undefined

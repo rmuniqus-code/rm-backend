@@ -11,6 +11,7 @@ import { errorHandler } from './middleware/error'
 import { requireAuth } from './middleware/auth'
 
 import { allocationsRouter } from './routes/allocations'
+import { employeesRouter } from './routes/employees'
 import { auditLogRouter } from './routes/audit-log'
 import { bookingsRouter } from './routes/bookings'
 import { dashboardDataRouter } from './routes/dashboard-data'
@@ -32,7 +33,7 @@ import { authRouter, adminRouter } from './routes/auth'
 const app = express()
 const PORT = Number(process.env.PORT ?? 5000)
 
-const allowedOrigins = (process.env.FRONTEND_ORIGIN ?? 'http://localhost:3000')
+const allowedOrigins = (process.env.FRONTEND_ORIGIN ?? 'http://localhost:4000')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
@@ -51,6 +52,7 @@ app.use('/auth', authRouter)
 app.use('/api', requireAuth)
 
 app.use('/api/allocations', allocationsRouter)
+app.use('/api/employees', employeesRouter)
 app.use('/api/audit-log', auditLogRouter)
 app.use('/api/bookings', bookingsRouter)
 app.use('/api/dashboard-data', dashboardDataRouter)

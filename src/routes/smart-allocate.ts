@@ -41,7 +41,7 @@ smartAllocateRouter.get('/', asyncHandler(async (req, res) => {
   const fromISO = (req.query.startDate as string) ?? mondayOf(today)
   const toISO = (req.query.endDate as string) ?? addWeeks(mondayOf(today), 4)
 
-  if (!primarySkill) return res.status(400).json({ error: 'primarySkill is required' })
+  // primarySkill is optional — when absent, return all active employees ranked by availability
 
   const sb = getSupabase()
 
@@ -51,6 +51,33 @@ smartAllocateRouter.get('/', asyncHandler(async (req, res) => {
     .eq('is_active', true)
     .order('name')
   if (empError) return res.status(500).json({ error: empError.message })
+
+  // Fetch UUIDs and primary_skill so shortlisting can store the proper FK reference
+  const { data: empDetailRows } = await sb
+    .from('employees')
+    .select('id,employee_id,primary_skill,years_experience,certifications,languages')
+  const uuidByEmpCode = new Map<string, string>()
+  const profileByEmpCode = new Map<string, { primarySkillDb: string; yearsExperience: number | null; certifications: string | null; languages: string | null }>()
+  for (const r of empDetailRows ?? []) {
+    if (r.employee_id) {
+      uuidByEmpCode.set(r.employee_id, r.id)
+      profileByEmpCode.set(r.employee_id, {
+        primarySkillDb: r.primary_skill ?? '',
+        yearsExperience: r.years_experience ?? null,
+        certifications: r.certifications ?? null,
+        languages: r.languages ?? null,
+      })
+    }
+  }
+
+  // Fetch confidential employee notes (shown to RM/admin when shortlisting)
+  const { data: noteRows } = await sb
+    .from('employee_notes')
+    .select('employee_id,note')
+  const noteByUUID = new Map<string, string>()
+  for (const n of noteRows ?? []) {
+    if (n.employee_id && n.note) noteByUUID.set(n.employee_id, n.note)
+  }
 
   const { data: skillRows } = await sb
     .from('v_employee_skills')
@@ -105,14 +132,30 @@ smartAllocateRouter.get('/', asyncHandler(async (req, res) => {
 
   const candidates: any[] = []
 
+  // Whether any employees have skill mappings at all (skill mapping file may not have been uploaded)
+  const hasSkillData = skillMap.size > 0
+
   for (const emp of empRows ?? []) {
     const empSkill = skillMap.get(emp.emp_code) ?? ''
-    if (empSkill.toLowerCase() !== primarySkill.toLowerCase()) continue
+
+    // Skill scoring: if a primarySkill was requested and skill data exists, only include
+    // employees whose primary skill matches (exact, case-insensitive).
+    // If no primarySkill requested OR no skill data has been uploaded, include everyone.
+    let skillScore = 0
+    if (primarySkill && hasSkillData) {
+      if (empSkill.toLowerCase() !== primarySkill.toLowerCase()) continue
+      skillScore = 50
+    } else if (primarySkill && !hasSkillData) {
+      // Skill data not loaded yet — include everyone with 0 skill score
+      skillScore = 0
+    } else {
+      // No skill filter — small bonus for having ANY skill mapped
+      skillScore = empSkill ? 20 : 0
+    }
 
     const util = avgUtil.get(emp.emp_code) ?? 0
     if (util > 100) continue
 
-    const skillScore = 50
     let availScore = 0
     if (util <= 50) availScore = 30
     else if (util <= 80) availScore = 20
@@ -132,8 +175,11 @@ smartAllocateRouter.get('/', asyncHandler(async (req, res) => {
 
     const fitScore = Math.min(skillScore + availScore + gradeScore, 100)
 
+    const empUUID = uuidByEmpCode.get(emp.emp_code) ?? emp.emp_code
+    const profile = profileByEmpCode.get(emp.emp_code)
     candidates.push({
-      id: emp.emp_code,
+      id: empUUID,
+      empCode: emp.emp_code,
       name: emp.name,
       grade: emp.designation ?? '',
       serviceLine: emp.department ?? '',
@@ -141,6 +187,10 @@ smartAllocateRouter.get('/', asyncHandler(async (req, res) => {
       location: emp.location ?? '',
       region: emp.region ?? '',
       primarySkill: empSkill,
+      yearsExperience: profile?.yearsExperience ?? null,
+      certifications: profile?.certifications ?? null,
+      languages: profile?.languages ?? null,
+      employeeNote: noteByUUID.get(empUUID) ?? null,
       utilization: util,
       fitScore,
       matchBreakdown: { skill: skillScore, availability: availScore, grade: gradeScore },

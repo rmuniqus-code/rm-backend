@@ -12,6 +12,7 @@ import { ingestForecastFile } from '../services/ingestion/ingest-forecast'
 import { isForecastTracker } from '../services/ingestion/parse-forecast'
 import { ingestSkillMappingFile } from '../services/ingestion/ingest-skill-mapping'
 import { isSkillMapping } from '../services/ingestion/parse-skill-mapping'
+import { ingestRmsFile, isRmsFile } from '../services/ingestion/ingest-rms'
 import { trackFileUpload } from '../services/file-versioning'
 import { logAudit } from '../services/audit'
 import { asyncHandler } from '../middleware/error'
@@ -62,14 +63,49 @@ uploadRouter.post('/', upload.single('file'), asyncHandler(async (req: AuthedReq
   const workbook = XLSX.read(buffer, { type: 'array' })
   let isForecast = false
   let isSkillMap = false
+  let isRms = false
   for (const sn of workbook.SheetNames) {
     const s = workbook.Sheets[sn]
     const row = (XLSX.utils.sheet_to_json(s, { header: 1 }) as unknown[][])[0] ?? []
     if (isSkillMapping(row)) { isSkillMap = true; break }
     if (isForecastTracker(row)) { isForecast = true; break }
+    if (isRmsFile(row)) { isRms = true; break }
   }
 
   const fileName = file.originalname
+
+  if (isRms) {
+    const result = await ingestRmsFile(buffer, fileName)
+    const status = result.errorCount === result.totalRows && result.totalRows > 0 ? 422 : 200
+
+    trackFileUpload({
+      fileName,
+      fileType: 'rms',
+      fileSize: file.size,
+      uploadLogId: result.uploadId,
+    }).catch(err => console.error('[upload] version tracking error:', err))
+
+    logAudit({
+      action: 'Created',
+      entity: 'Employee',
+      entityName: fileName,
+      entityId: result.uploadId,
+      userName: uploaderName,
+      field: 'file_import',
+      newValue: `Imported ${result.successCount}/${result.totalRows} rows`,
+      metadata: {
+        fileName,
+        fileType: 'rms',
+        fileSize: file.size,
+        totalRows: result.totalRows,
+        successCount: result.successCount,
+        errorCount: result.errorCount,
+        duration: result.duration,
+      },
+    }).catch(() => {})
+
+    return res.status(status).json(result)
+  }
 
   if (isSkillMap) {
     const result = await ingestSkillMappingFile(buffer, fileName)
