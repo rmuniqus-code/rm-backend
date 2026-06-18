@@ -30,6 +30,8 @@ import { uploadRouter } from './routes/upload'
 import { utilizationRouter } from './routes/utilization'
 import { authRouter, adminRouter } from './routes/auth'
 import { forecastSummaryRouter } from './routes/forecast-summary'
+import { chargeabilityPerformanceRouter } from './routes/chargeability-performance'
+import { rolePermissionsRouter } from './routes/role-permissions'
 
 const app = express()
 const PORT = Number(process.env.PORT ?? 5000)
@@ -72,6 +74,8 @@ app.use('/api/upload', uploadRouter)
 app.use('/api/utilization', utilizationRouter)
 app.use('/api/admin', adminRouter)
 app.use('/api/forecast-summary', forecastSummaryRouter)
+app.use('/api/chargeability-performance', chargeabilityPerformanceRouter)
+app.use('/api/role-permissions', rolePermissionsRouter)
 
 app.use(errorHandler)
 

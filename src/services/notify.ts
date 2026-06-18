@@ -34,6 +34,33 @@ export async function resolveEmployeeIdByEmail(email?: string | null): Promise<s
   return (data?.id as string | undefined) ?? null
 }
 
+/**
+ * Resolve the employees.id UUID by employee display name.
+ * Returns null if no matching employee record is found.
+ */
+async function resolveEmployeeIdByName(name?: string | null): Promise<string | null> {
+  if (!name) return null
+  const { data } = await supabaseAdmin()
+    .from('employees')
+    .select('id')
+    .ilike('name', name.trim())
+    .maybeSingle()
+  return (data?.id as string | undefined) ?? null
+}
+
+/** Structured payload stored in notifications.metadata for booking_confirmed cards. */
+export interface AllocationNotificationMetadata {
+  resourceName: string
+  roleSkill: string | null
+  startDate: string
+  endDate: string
+  loadingPct: number
+  projectName: string
+  projectCode: string | null
+  emEpName: string | null
+  projectDescription: string | null
+}
+
 interface NotificationPayload {
   type: string
   title: string
@@ -41,6 +68,7 @@ interface NotificationPayload {
   recipientId?: string | null
   relatedEntityType?: string | null
   relatedEntityId?: string | null
+  metadata?: AllocationNotificationMetadata | null
 }
 
 export async function emitNotification(payload: NotificationPayload): Promise<void> {
@@ -54,6 +82,7 @@ export async function emitNotification(payload: NotificationPayload): Promise<vo
         recipient_id:        payload.recipientId ?? null,
         related_entity_type: payload.relatedEntityType ?? null,
         related_entity_id:   payload.relatedEntityId ?? null,
+        metadata:            payload.metadata ?? null,
       })
   } catch (err) {
     // Don't let notification failures break the calling API
@@ -80,20 +109,75 @@ export async function notifyRequestRaised(
 
 /**
  * Emit notification when a booking is confirmed (allocation created).
+ * Sends targeted notifications to:
+ *   1. The resource (employee being allocated)
+ *   2. The EM/EP (resolved by name from the employees table)
+ *   3. The approving RM/admin (actor)
+ * Each notification carries structured metadata for the allocation detail card.
  */
-export async function notifyBookingConfirmed(
-  employeeName: string,
-  projectName: string,
-  startDate: string,
-  endDate: string,
-  emEpName?: string,
-): Promise<void> {
-  await emitNotification({
-    type: 'booking_confirmed',
-    title: 'Booking Confirmed',
-    message: `${employeeName} allocated to ${projectName} (${startDate} – ${endDate})${emEpName ? ` — EM/EP: ${emEpName}` : ''}`,
-    relatedEntityType: 'project',
-  })
+export async function notifyAllocationConfirmed(opts: {
+  requestId: string
+  resourceEmployeeId: string
+  resourceName: string
+  roleSkill: string | null
+  startDate: string
+  endDate: string
+  loadingPct: number
+  projectName: string
+  projectCode: string | null
+  emEpName: string | null
+  projectDescription: string | null
+  actorEmployeeId: string | null
+}): Promise<void> {
+  const metadata: AllocationNotificationMetadata = {
+    resourceName:       opts.resourceName,
+    roleSkill:          opts.roleSkill,
+    startDate:          opts.startDate,
+    endDate:            opts.endDate,
+    loadingPct:         opts.loadingPct,
+    projectName:        opts.projectName,
+    projectCode:        opts.projectCode,
+    emEpName:           opts.emEpName,
+    projectDescription: opts.projectDescription,
+  }
+
+  const title   = 'Resource Booking Confirmed'
+  const message = `${opts.resourceName} allocated to ${opts.projectName} (${opts.startDate} – ${opts.endDate})`
+
+  const emitSafe = async (payload: NotificationPayload) => {
+    try { await emitNotification(payload) } catch (err) {
+      console.error('[notify] notifyAllocationConfirmed failed:', err)
+    }
+  }
+
+  const base = {
+    type:              'booking_confirmed',
+    title,
+    message,
+    relatedEntityType: 'resource_request',
+    relatedEntityId:   opts.requestId,
+    metadata,
+  }
+
+  // Track which employee IDs have already been notified to avoid duplicates
+  const notified = new Set<string>()
+
+  // 1. Notify the resource
+  await emitSafe({ ...base, recipientId: opts.resourceEmployeeId })
+  notified.add(opts.resourceEmployeeId)
+
+  // 2. Notify EM/EP — resolve by name
+  const emEpEmployeeId = await resolveEmployeeIdByName(opts.emEpName)
+  if (emEpEmployeeId && !notified.has(emEpEmployeeId)) {
+    await emitSafe({ ...base, recipientId: emEpEmployeeId })
+    notified.add(emEpEmployeeId)
+  }
+
+  // 3. Notify the approving RM/admin actor
+  if (opts.actorEmployeeId && !notified.has(opts.actorEmployeeId)) {
+    await emitSafe({ ...base, recipientId: opts.actorEmployeeId })
+    notified.add(opts.actorEmployeeId)
+  }
 }
 
 /**

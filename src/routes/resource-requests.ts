@@ -6,7 +6,8 @@
 import { Router } from 'express'
 import { supabaseAdmin } from '../db/supabase-admin'
 import { asyncHandler, parseInt32 } from '../middleware/error'
-import { notifyRequestRaised, notifyBookingConfirmed } from '../services/notify'
+import { notifyRequestRaised, notifyAllocationConfirmed } from '../services/notify'
+import { resolveEmployeeIdByEmail } from '../services/notify'
 import { logAudit, logAuditDiff } from '../services/audit'
 import type { AuthedRequest } from '../middleware/auth'
 
@@ -278,7 +279,7 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
 
   const { data: request, error: fetchErr } = await sb
     .from('resource_requests')
-    .select('*, project:projects(name)')
+    .select('*, project:projects(name, code, project_description, engagement_manager, engagement_partner)')
     .eq('id', id)
     .single()
 
@@ -333,23 +334,23 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
     return res.status(400).json({ error: 'Approval requires an allocated employee. Provide allocated_employee or ensure resource_requested is set on the request.' })
   }
 
-  let empRow: { id: string } | null = null
+  let empRow: { id: string; skill_set: string | null } | null = null
   const { data: byId } = await sb
     .from('employees')
-    .select('id')
+    .select('id, skill_set')
     .eq('employee_id', allocatedName)
     .limit(1)
     .maybeSingle()
   if (byId) {
-    empRow = byId as { id: string }
+    empRow = byId as { id: string; skill_set: string | null }
   } else {
     const { data: byName } = await sb
       .from('employees')
-      .select('id')
+      .select('id, skill_set')
       .ilike('name', allocatedName)
       .limit(1)
       .maybeSingle()
-    empRow = byName as { id: string } | null
+    empRow = byName as { id: string; skill_set: string | null } | null
   }
 
   if (!empRow) {
@@ -415,7 +416,7 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
     .from('resource_requests')
     .update(updatePayload)
     .eq('id', id)
-    .select('*, project:projects(name)')
+    .select('*, project:projects(name, code, project_description, engagement_manager, engagement_partner)')
     .single()
 
   if (updateErr) return res.status(500).json({ error: updateErr.message })
@@ -453,12 +454,28 @@ resourceRequestsRouter.post('/:id/approve', asyncHandler(async (req: AuthedReque
     },
   })
 
-  notifyBookingConfirmed(
-    allocatedName,
+  const project = (request as any).project ?? {}
+  const emEpName = request.em_ep_name
+    ?? (project.engagement_manager && project.engagement_partner
+        ? `${project.engagement_manager} / ${project.engagement_partner}`
+        : project.engagement_manager ?? project.engagement_partner ?? null)
+
+  const actorEmployeeId = await resolveEmployeeIdByEmail(req.user?.email)
+
+  notifyAllocationConfirmed({
+    requestId:          id,
+    resourceEmployeeId: emp.id,
+    resourceName:       allocatedName,
+    roleSkill:          emp.skill_set ?? request.primary_skill ?? null,
+    startDate:          request.start_date,
+    endDate:            request.end_date,
+    loadingPct:         pct,
     projectName,
-    request.start_date,
-    request.end_date,
-  )
+    projectCode:        project.code ?? null,
+    emEpName,
+    projectDescription: project.project_description ?? null,
+    actorEmployeeId,
+  })
 
   res.json({ request: updatedRequest, allocationsCreated })
 }))
